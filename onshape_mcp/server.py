@@ -61,6 +61,14 @@ from .builders.pattern import LinearPatternBuilder, CircularPatternBuilder
 from .builders.boolean import BooleanBuilder, BooleanType
 from .analysis.interference import check_assembly_interference, format_interference_result
 from .analysis.positioning import get_assembly_positions, set_absolute_position, align_to_face
+from .governance import (
+    ContextNotFoundError,
+    ContextStore,
+    ObservationEnvelope,
+    compact_feature_page,
+    serialize_bounded,
+    summarize_features,
+)
 
 # Configure loguru to output to stderr
 logger.remove()  # Remove default handler
@@ -114,6 +122,7 @@ list_entities, or from create_offset_plane).
 - update_feature — patch params on an existing feature (iteration)
 
 ### Introspection (USE OFTEN)
+- start_model_context / get_feature_tree_compact / get_context_status — bounded onboarding and cached feature-tree reads
 - describe_part_studio — topology + multi-view renders in one call. First stop after every mutation.
 - list_entities — faces/edges/vertices with filters: outward_axis, at_z_mm, geometryType, radius_range_mm, length_range_mm
 - get_features / get_body_details — feature tree with statuses, per-part face/edge IDs
@@ -177,6 +186,29 @@ entity_manager = EntityManager(client)
 measurement_manager = MeasurementManager(client)
 describe_manager = DescribeManager(client)
 custom_feature_manager = CustomFeatureManager(client)
+context_store = ContextStore()
+
+
+def _governance_content(envelope: ObservationEnvelope, record: Any) -> list[TextContent]:
+    text = serialize_bounded(envelope, context_store.policy, record.working_state.budget)
+    record.working_state.budget.record_inline_bytes(len(text.encode("utf-8")))
+    return [TextContent(type="text", text=text)]
+
+
+def _context_not_found_content(error: ContextNotFoundError) -> list[TextContent]:
+    payload = {
+        "error": {
+            "type": "context_not_found",
+            "message": "Unknown context handle",
+            "context_handle": error.context_handle[:128],
+        }
+    }
+    return [
+        TextContent(
+            type="text",
+            text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+    ]
 
 
 @app.list_tools()
@@ -474,6 +506,53 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["documentId", "workspaceId", "elementId", "name", "expression"],
+            },
+        ),
+        Tool(
+            name="start_model_context",
+            description=(
+                "Start bounded Part Studio onboarding with one feature-tree read. "
+                "The raw Onshape response stays in the server-side context cache."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {"type": "string", "description": "Part Studio element ID"},
+                },
+                "required": ["documentId", "workspaceId", "elementId"],
+            },
+        ),
+        Tool(
+            name="get_feature_tree_compact",
+            description="Read a normalized, paged feature tree from a model context cache.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 25,
+                    },
+                    "status": {"type": "string", "description": "Optional feature status filter"},
+                    "query": {"type": "string", "description": "Optional name, ID, or type query"},
+                },
+                "required": ["contextHandle"],
+            },
+        ),
+        Tool(
+            name="get_context_status",
+            description="Get compact model, cache, ledger, and budget state for a context.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"}
+                },
+                "required": ["contextHandle"],
             },
         ),
         Tool(
@@ -3098,6 +3177,124 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                     text=f"Error setting variable: {str(e)}",
                 )
             ]
+
+    elif name == "start_model_context":
+        record = None
+        try:
+            record = context_store.create(
+                arguments["documentId"], arguments["workspaceId"], arguments["elementId"]
+            )
+            handle = record.working_state.context_handle
+            record.working_state.budget.record_call(onshape_read=True)
+            context_store.record_onshape_read(handle)
+            raw_features = await partstudio_manager.get_features(
+                arguments["documentId"], arguments["workspaceId"], arguments["elementId"]
+            )
+            record = context_store.store_features(handle, raw_features)
+            summary = summarize_features(raw_features, record.working_state.revision_id)
+            envelope = ObservationEnvelope(
+                context_handle=handle,
+                level="L0",
+                summary=summary,
+                data={},
+                cache=dict(record.cache_metadata),
+            )
+            return _governance_content(envelope, record)
+        except httpx.HTTPStatusError as e:
+            if record is not None:
+                context_store.delete(record.working_state.context_handle)
+            logger.error(
+                f"API error starting model context: {e.response.status_code} - {e.response.text[:500]}"
+            )
+            payload = {
+                "error": {
+                    "type": "onshape_read_failed",
+                    "message": "Unable to start model context",
+                }
+            }
+            return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
+        except Exception:
+            if record is not None:
+                context_store.delete(record.working_state.context_handle)
+            logger.exception("Unexpected error starting model context")
+            payload = {
+                "error": {
+                    "type": "context_start_failed",
+                    "message": "Unable to start model context",
+                }
+            }
+            return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
+
+    elif name == "get_feature_tree_compact":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _context_not_found_content(e)
+
+        try:
+            offset = max(0, int(arguments.get("offset", 0)))
+            requested_limit = int(arguments.get("limit", 25))
+            limit = max(
+                1,
+                min(requested_limit, context_store.policy.max_feature_rows, 50),
+            )
+            record.working_state.budget.record_call()
+            context_store.record_cache_read(record.working_state.context_handle)
+            page = compact_feature_page(
+                record.raw_features,
+                offset=offset,
+                limit=limit,
+                status_filter=arguments.get("status"),
+                text_query=arguments.get("query"),
+            )
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L1",
+                summary={"matching_feature_count": page["total"]},
+                data=page,
+                truncated=page["has_more"],
+                cache=dict(record.cache_metadata),
+            )
+            return _governance_content(envelope, record)
+        except (TypeError, ValueError):
+            payload = {
+                "error": {
+                    "type": "invalid_paging",
+                    "message": "offset and limit must be integers",
+                }
+            }
+            return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
+
+    elif name == "get_context_status":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _context_not_found_content(e)
+
+        record.working_state.budget.record_call()
+        state = record.working_state
+        policy = context_store.policy
+        data = {
+            "model_ref": state.model_ref.to_dict(),
+            "revision_id": state.revision_id,
+            "phase": state.phase,
+            "focus": list(state.focus),
+            "cache": dict(record.cache_metadata),
+            "budget": {
+                "policy": dict(vars(policy)),
+                "used": state.budget.used(),
+                "remaining": state.budget.remaining(policy),
+            },
+            "ledger": record.ledger.summary(),
+        }
+        envelope = ObservationEnvelope(
+            context_handle=state.context_handle,
+            level="L0",
+            summary={"phase": state.phase},
+            data=data,
+            cache=dict(record.cache_metadata),
+        )
+        return _governance_content(envelope, record)
 
     elif name == "get_features":
         try:
