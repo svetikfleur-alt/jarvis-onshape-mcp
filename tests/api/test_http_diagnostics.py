@@ -13,13 +13,16 @@ import pytest
 from loguru import logger
 
 from onshape_mcp.api import request_guard
+from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
 from onshape_mcp.api.custom_features import CustomFeatureManager
 from onshape_mcp.api.drawing_section import DrawingSectionManager
 from onshape_mcp.api.export import ExportManager
 from onshape_mcp.api.feature_apply import apply_feature_and_check
+from onshape_mcp.api.partstudio import PartStudioManager
 from onshape_mcp.api.rendering import ShadedViewManager
 from onshape_mcp.api.sketch_edit import _merge
 from onshape_mcp.api.variables import VariableManager
+from onshape_mcp.governance.context import ContextStore
 from onshape_mcp.server import _exception_json, call_tool
 
 
@@ -327,6 +330,79 @@ async def test_start_model_context_request_error_log_omits_raw_exception_url():
     assert "ConnectError" in log_output
     assert "/api/v9/documents/d/{documentId}" in log_output
     _assert_no_poison(log_output)
+
+
+@pytest.mark.asyncio
+async def test_start_model_context_budget_overflow_log_omits_request_traceback():
+    """A sanitized budget error must not diagnose raw transport-frame locals."""
+    events: list[str] = []
+    sink_id = logger.add(
+        events.append,
+        format="{message}\n{exception}",
+        diagnose=True,
+        backtrace=True,
+        colorize=False,
+    )
+    inner_calls = 0
+
+    def forbidden_inner_send(request: httpx.Request) -> httpx.Response:
+        nonlocal inner_calls
+        inner_calls += 1
+        return httpx.Response(200, request=request, json={"features": []})
+
+    guard = request_guard.LiveBudgetGuard(
+        "LIVE-DEEP-READ-01",
+        0,
+        request_guard.LiveSuiteBudget(0),
+    )
+    transport = request_guard.BudgetedAsyncTransport(
+        httpx.MockTransport(forbidden_inner_send),
+        guard,
+    )
+    credentials = OnshapeCredentials(
+        access_key="private-access-canary",
+        secret_key="private-secret-canary",
+    )
+
+    try:
+        async with OnshapeClient(credentials, transport=transport) as client:
+            manager = PartStudioManager(client)
+
+            async def get_features(
+                document_id: str, workspace_id: str, element_id: str
+            ) -> dict[str, object]:
+                return await client.get(
+                    f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}"
+                    f"/e/{element_id}/features",
+                    params={"include": PRIVATE_QUERY},
+                )
+
+            manager.get_features = get_features  # type: ignore[method-assign]
+            with (
+                patch("onshape_mcp.server.partstudio_manager", manager),
+                patch("onshape_mcp.server.context_store", ContextStore()),
+            ):
+                result = await call_tool(
+                    "start_model_context",
+                    {
+                        "documentId": PRIVATE_DOCUMENT_ID,
+                        "workspaceId": PRIVATE_WORKSPACE_ID,
+                        "elementId": PRIVATE_ELEMENT_ID,
+                    },
+                )
+    finally:
+        logger.remove(sink_id)
+
+    assert json.loads(result[0].text)["error"]["type"] == "context_start_failed"
+    assert inner_calls == 0
+    log_output = "".join(events)
+    assert "LIVE_API_BUDGET_EXCEEDED" in log_output
+    assert "/api/v9/partstudios/d/{documentId}/w/{workspaceId}/e/{elementId}/features" in (
+        log_output
+    )
+    _assert_no_poison(log_output)
+    assert "private-access-canary" not in log_output
+    assert "private-secret-canary" not in log_output
 
 
 @pytest.mark.asyncio

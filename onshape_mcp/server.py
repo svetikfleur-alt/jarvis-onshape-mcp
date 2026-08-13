@@ -19,7 +19,11 @@ _package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_package_dir, ".env"))
 
 from .api.client import OnshapeClient, OnshapeCredentials
-from .api.request_guard import safe_exception_message, safe_http_diagnostic
+from .api.request_guard import (
+    LiveApiBudgetExceeded,
+    safe_exception_message,
+    safe_http_diagnostic,
+)
 from .api.partstudio import PartStudioManager
 from .api.variables import VariableManager
 from .api.documents import DocumentManager
@@ -2814,9 +2818,9 @@ def _safe_exception_message(error: BaseException) -> str:
 
 
 def _log_unexpected_error(message: str, error: BaseException) -> None:
-    """Avoid traceback formatting only when it would stringify an HTTP error."""
-    if isinstance(error, httpx.HTTPError):
-        logger.error("{}: {}", message, safe_http_diagnostic(error))
+    """Avoid tracebacks whose locals can retain raw HTTP request details."""
+    if isinstance(error, (httpx.HTTPError, LiveApiBudgetExceeded)):
+        logger.error("{}: {}", message, safe_exception_message(error))
     else:
         logger.exception(message)
 

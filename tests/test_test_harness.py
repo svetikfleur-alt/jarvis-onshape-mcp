@@ -1,6 +1,7 @@
 """Acceptance tests for the offline-by-default pytest harness."""
 
 import asyncio
+import _socket
 import os
 from pathlib import Path
 import socket
@@ -763,6 +764,21 @@ async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidde
 def test_network_guard_declares_every_public_datagram_send_boundary() -> None:
     assert "sendto" in _SOCKET_SEND_METHODS
     assert "sendmsg" in _SOCKET_SEND_METHODS
+
+
+@pytest.mark.parametrize("socket_factory", [socket.SocketType, _socket.socket])
+def test_low_level_socket_aliases_cannot_bypass_connect_policy(socket_factory) -> None:
+    direct_socket = socket_factory(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+            direct_socket.connect_ex(("127.0.0.1", 9))
+    finally:
+        direct_socket.close()
+
+
+def test_low_level_dns_alias_cannot_bypass_network_policy() -> None:
+    with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+        _socket.getaddrinfo("localhost", 80)
 
 
 @pytest.mark.asyncio

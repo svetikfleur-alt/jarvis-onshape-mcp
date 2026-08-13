@@ -5,17 +5,37 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from functools import partial
 import socket
+import sys
 
 
 NETWORK_ACCESS_FORBIDDEN_IN_TEST = "NETWORK_ACCESS_FORBIDDEN_IN_TEST"
 _CAPABILITY = object()
 _network_capability: ContextVar[object | None] = ContextVar("guarded_network", default=None)
 _SOCKET_SEND_METHODS = ("connect", "connect_ex", "sendto", "sendmsg")
+_AUDITED_NETWORK_EVENTS = frozenset(
+    {
+        "socket.connect",
+        "socket.getaddrinfo",
+        "socket.gethostbyaddr",
+        "socket.gethostbyname",
+        "socket.gethostbyname_ex",
+        "socket.getnameinfo",
+        "socket.sendmsg",
+        "socket.sendto",
+    }
+)
+_audit_hook_installed = False
 
 
 def _require_permit(*args: object, **kwargs: object) -> None:
     if _network_capability.get() is not _CAPABILITY:
         raise RuntimeError(NETWORK_ACCESS_FORBIDDEN_IN_TEST)
+
+
+def _network_audit_hook(event: str, args: tuple[object, ...]) -> None:
+    """Backstop aliases of the immutable low-level ``_socket.socket`` type."""
+    if event in _AUDITED_NETWORK_EVENTS:
+        _require_permit()
 
 
 @contextmanager
@@ -28,6 +48,11 @@ def _permit_guarded_network():
 
 
 def install_network_guard(monkeypatch) -> None:
+    global _audit_hook_installed
+    if not _audit_hook_installed:
+        sys.addaudithook(_network_audit_hook)
+        _audit_hook_installed = True
+
     original_socketpair = socket.socketpair
     original_getaddrinfo = socket.getaddrinfo
     original_getnameinfo = socket.getnameinfo
