@@ -9,7 +9,11 @@ import httpx
 from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
 from onshape_mcp.api.request_guard import BudgetedAsyncTransport, LiveBudgetGuard, LiveSuiteBudget
 from tests.support.live_config import LiveConfigurationError, load_live_config
-from tests.support.network_guard import _permit_guarded_network, install_network_guard
+from tests.support.network_guard import (
+    _permit_guarded_network,
+    install_network_guard,
+    uninstall_network_guard,
+)
 
 
 def pytest_configure(config):
@@ -32,7 +36,11 @@ def pytest_configure(config):
 def pytest_unconfigure(config):
     network_patches = getattr(config, "_jarvis_network_patches", None)
     if network_patches is not None:
-        network_patches.undo()
+        try:
+            network_patches.undo()
+        finally:
+            uninstall_network_guard()
+            config._jarvis_network_patches = None
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

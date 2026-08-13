@@ -781,6 +781,46 @@ def test_low_level_dns_alias_cannot_bypass_network_policy() -> None:
         _socket.getaddrinfo("localhost", 80)
 
 
+def test_embedded_pytest_restores_low_level_network_after_unconfigure(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_subprocess(pytester, monkeypatch)
+    pytester.makepyfile(
+        test_embedded="""
+import _socket
+import pytest
+
+def test_low_level_network_is_guarded_during_pytest():
+    direct_socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        with pytest.raises(RuntimeError, match="NETWORK_ACCESS_FORBIDDEN_IN_TEST"):
+            direct_socket.connect_ex(("127.0.0.1", 9))
+    finally:
+        direct_socket.close()
+"""
+    )
+
+    result = pytester.runpython_c(
+        """
+import _socket
+import pytest
+
+exit_code = pytest.main(["-q", "test_embedded.py"])
+assert exit_code == pytest.ExitCode.OK
+direct_socket = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+try:
+    direct_socket.settimeout(0.2)
+    result = direct_socket.connect_ex(("127.0.0.1", 9))
+finally:
+    direct_socket.close()
+print(f"POST_PYTEST_CONNECT_EX={result}")
+"""
+    )
+
+    assert result.ret == 0
+    result.stdout.fnmatch_lines(["*1 passed*", "POST_PYTEST_CONNECT_EX=*"])
+
+
 @pytest.mark.asyncio
 async def test_running_event_loop_sock_connect_is_guarded() -> None:
     direct_socket = socket.socket()

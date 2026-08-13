@@ -6,6 +6,7 @@ from contextvars import ContextVar, copy_context
 from functools import partial
 import socket
 import sys
+from threading import Lock
 
 
 NETWORK_ACCESS_FORBIDDEN_IN_TEST = "NETWORK_ACCESS_FORBIDDEN_IN_TEST"
@@ -24,7 +25,9 @@ _AUDITED_NETWORK_EVENTS = frozenset(
         "socket.sendto",
     }
 )
+_guard_state_lock = Lock()
 _audit_hook_installed = False
+_active_guard_sessions = 0
 
 
 def _require_permit(*args: object, **kwargs: object) -> None:
@@ -34,7 +37,11 @@ def _require_permit(*args: object, **kwargs: object) -> None:
 
 def _network_audit_hook(event: str, args: tuple[object, ...]) -> None:
     """Backstop aliases of the immutable low-level ``_socket.socket`` type."""
-    if event in _AUDITED_NETWORK_EVENTS:
+    if event not in _AUDITED_NETWORK_EVENTS:
+        return
+    with _guard_state_lock:
+        active = _active_guard_sessions > 0
+    if active:
         _require_permit()
 
 
@@ -48,10 +55,12 @@ def _permit_guarded_network():
 
 
 def install_network_guard(monkeypatch) -> None:
-    global _audit_hook_installed
-    if not _audit_hook_installed:
-        sys.addaudithook(_network_audit_hook)
-        _audit_hook_installed = True
+    global _active_guard_sessions, _audit_hook_installed
+    with _guard_state_lock:
+        if not _audit_hook_installed:
+            sys.addaudithook(_network_audit_hook)
+            _audit_hook_installed = True
+        _active_guard_sessions += 1
 
     original_socketpair = socket.socketpair
     original_getaddrinfo = socket.getaddrinfo
@@ -142,3 +151,11 @@ def install_network_guard(monkeypatch) -> None:
         seen_classes.add(loop_class)
         seen_methods.add(id(original))
         monkeypatch.setattr(loop_class, "sock_connect", guarded(original))
+
+
+def uninstall_network_guard() -> None:
+    """Deactivate one pytest session while leaving the process audit hook inert."""
+    global _active_guard_sessions
+    with _guard_state_lock:
+        if _active_guard_sessions > 0:
+            _active_guard_sessions -= 1
