@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .client import OnshapeClient
-from .entities import EntityManager, _classify_edge, _classify_face, _classify_vertex
+from .entities import EntityManager
 from .featurescript import FeatureScriptManager
 from .measurements import MeasurementManager
 from .partstudio import PartStudioManager
@@ -293,7 +293,6 @@ def _mass_props_text(mp: Dict[str, Any]) -> str:
             # Onshape returns [x_min, x_max, y_min, y_max, z_min, z_max] sometimes,
             # or [[x_min, x_mean, x_max], ...]. Normalize via mean.
             try:
-                xs = com[:2] if len(com) <= 6 else com[0]
                 com_txt = f"centroid≈({_fmt_mm((com[0]+com[1])/2) if len(com) >= 2 else '?'}, ...)"
             except Exception:
                 com_txt = ""
