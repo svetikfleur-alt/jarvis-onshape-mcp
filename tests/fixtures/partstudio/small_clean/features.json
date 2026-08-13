@@ -1,0 +1,66 @@
+{
+  "serializationVersion": "1.2.3",
+  "sourceMicroversion": "synthetic-microversion-001",
+  "features": [
+    {
+      "btType": "BTMSketch-151",
+      "featureId": "sketch-1",
+      "featureType": "newSketch",
+      "name": "Base Profile",
+      "suppressed": false,
+      "parameters": [
+        {
+          "btType": "BTMParameterQuantity-147",
+          "parameterId": "width",
+          "expression": "25 mm",
+          "value": 0.025,
+          "units": "m"
+        },
+        {
+          "btType": "BTMParameterUnknown-999",
+          "parameterId": "private-sketch-extension",
+          "unsupportedRaw": {
+            "poisonCanary": "RAW_POISON_SMALL_CLEAN_SKETCH_7F2A"
+          }
+        }
+      ]
+    },
+    {
+      "btType": "BTMFeature-134",
+      "featureId": "extrude-1",
+      "featureType": "extrude",
+      "name": "Main Extrude",
+      "suppressed": false,
+      "parameters": [
+        {
+          "btType": "BTMParameterQueryList-148",
+          "parameterId": "entities",
+          "queries": [
+            {
+              "btType": "BTMIndividualSketchRegionQuery-140",
+              "featureId": "sketch-1",
+              "deterministicIds": ["SYNTHETIC_REGION_001"]
+            }
+          ]
+        },
+        {
+          "btType": "BTMParameterUnknown-999",
+          "parameterId": "private-extrude-extension",
+          "unsupportedRaw": {
+            "poisonCanary": "RAW_POISON_SMALL_CLEAN_EXTRUDE_9C4D"
+          }
+        }
+      ]
+    }
+  ],
+  "featureStates": {
+    "sketch-1": {
+      "featureStatus": "OK",
+      "messages": []
+    },
+    "extrude-1": {
+      "featureStatus": "OK",
+      "messages": []
+    }
+  }
+}
