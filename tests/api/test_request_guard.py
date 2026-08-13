@@ -302,6 +302,33 @@ def test_event_fields_and_repr_contain_no_poison_canaries_or_request_objects():
     assert not any(isinstance(value, (httpx.Request, httpx.Response)) for value in vars(event).values())
 
 
+def test_unregistered_uppercase_scenario_identifier_is_not_emitted():
+    events = []
+    suite = LiveSuiteBudget(limit=1)
+    private_scenario = "LIVE-PRIVATE-DOCUMENT-CANARY-01"
+    guard = LiveBudgetGuard(private_scenario, 1, suite, event_sink=events)
+
+    guard.reserve()
+
+    assert guard.test_name == "LIVE-SCENARIO"
+    assert events[0].test_identifier == "LIVE-SCENARIO"
+    assert private_scenario not in repr(events[0])
+
+
+def test_event_sink_rejects_executable_callback_before_accounting():
+    suite = LiveSuiteBudget(limit=1)
+
+    with pytest.raises(TypeError, match="event_sink must be a built-in list"):
+        LiveBudgetGuard(
+            "LIVE-DEEP-READ-01",
+            1,
+            suite,
+            event_sink=lambda event: (_ for _ in ()).throw(RuntimeError("sink ran")),
+        )
+
+    assert suite.used == 0
+
+
 def test_suite_budget_overflow_does_not_consume_a_physical_send():
     suite = LiveSuiteBudget(limit=1)
     first = LiveBudgetGuard("LIVE-DEEP-READ-01", 3, suite)

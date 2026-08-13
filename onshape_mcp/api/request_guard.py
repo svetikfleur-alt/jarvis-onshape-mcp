@@ -1,7 +1,7 @@
 """Safe accounting for live HTTP requests at the supported HTTPX boundary."""
 
 import re
-from collections.abc import Callable, MutableSequence
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock
@@ -56,7 +56,7 @@ _COLLECTION_IDENTIFIERS = {
     "translations": "translationId",
 }
 _SAFE_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
-_SAFE_SCENARIO = re.compile(r"LIVE-[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-\d{2}")
+_SAFE_SCENARIOS = frozenset({"LIVE-DEEP-READ-01"})
 _GENERIC_SCENARIO = "LIVE-SCENARIO"
 
 
@@ -74,8 +74,8 @@ def _identifier_after_collection(
 
 
 def _sanitize_test_identifier(test_name: str) -> str:
-    """Keep only explicit, bounded live scenario identifiers."""
-    if _SAFE_SCENARIO.fullmatch(test_name):
+    """Keep only explicitly registered, non-private live scenario identifiers."""
+    if test_name in _SAFE_SCENARIOS:
         return test_name
     return _GENERIC_SCENARIO
 
@@ -112,7 +112,7 @@ class LiveRequestEvent:
     blocked_scope: BlockedScope
 
 
-EventSink = Callable[[LiveRequestEvent], None] | MutableSequence[LiveRequestEvent]
+EventSink = list[LiveRequestEvent]
 
 
 def sanitize_request(method: str, url: httpx.URL) -> RequestDescriptor:
@@ -219,6 +219,8 @@ class LiveBudgetGuard:
     ) -> None:
         if test_limit < 0:
             raise ValueError("Live test budget limit must be non-negative")
+        if event_sink is not None and type(event_sink) is not list:
+            raise TypeError("event_sink must be a built-in list")
         self.test_name = _sanitize_test_identifier(test_name)
         self.test_limit = test_limit
         self.suite_budget = suite_budget
@@ -243,10 +245,7 @@ class LiveBudgetGuard:
             suite_limit=self.suite_budget.limit,
             blocked_scope=blocked_scope,
         )
-        if callable(sink):
-            sink(event)
-        else:
-            sink.append(event)
+        sink.append(event)
 
     def reserve(self, descriptor: Optional[RequestDescriptor] = None) -> None:
         """Atomically reserve one physical send or fail before it reaches HTTPX."""
