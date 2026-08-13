@@ -1,6 +1,7 @@
 """Acceptance tests for the offline-by-default pytest harness."""
 
 import asyncio
+import os
 from pathlib import Path
 import socket
 import threading
@@ -36,6 +37,8 @@ _LIVE_ENV_NAMES = (
 def _configure_subprocess(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _LIVE_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    monkeypatch.setenv("PYTHONUTF8", "1")
     repository = Path(__file__).resolve().parents[1]
     pytester.makeconftest(
         f"""
@@ -57,6 +60,18 @@ def _enable_readonly_live(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+
+
+def test_subprocess_helper_forces_utf8_child_output(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+
+    _configure_subprocess(pytester, monkeypatch)
+
+    assert os.environ["PYTHONIOENCODING"] == "utf-8"
+    assert os.environ["PYTHONUTF8"] == "1"
 
 
 def test_selected_live_readonly_test_reaches_setup_when_fully_configured(
