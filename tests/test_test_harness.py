@@ -5,12 +5,23 @@ import os
 from pathlib import Path
 import socket
 import threading
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
-from onshape_mcp.api.request_guard import BudgetedAsyncTransport, LiveBudgetGuard, LiveSuiteBudget
+from onshape_mcp.api.request_guard import (
+    BudgetedAsyncTransport,
+    LiveBudgetGuard,
+    LiveRequestEvent,
+    LiveSuiteBudget,
+)
+from tests.conftest import (
+    live_session_telemetry,
+    pytest_collection_modifyitems,
+    pytest_terminal_summary,
+)
 from tests.support.network_guard import (
     NETWORK_ACCESS_FORBIDDEN_IN_TEST,
     _permit_guarded_network,
@@ -32,6 +43,30 @@ _LIVE_ENV_NAMES = (
     "ONSHAPE_API_SECRET",
     "PYTEST_XDIST_WORKER",
 )
+
+
+class _FakeTerminalReporter:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def section(self, title: str) -> None:
+        self.lines.append(title)
+
+    def write_line(self, line: str) -> None:
+        self.lines.append(line)
+
+
+class _FakeConfig:
+    pass
+
+
+class _FakeLiveItem:
+    name = "test_synthetic_live_scenario"
+
+    def get_closest_marker(self, name: str):
+        if name in {"live_onshape", "live_readonly"}:
+            return SimpleNamespace(args=())
+        return None
 
 
 def _configure_subprocess(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,6 +107,114 @@ def test_subprocess_helper_forces_utf8_child_output(
 
     assert os.environ["PYTHONIOENCODING"] == "utf-8"
     assert os.environ["PYTHONUTF8"] == "1"
+
+
+def test_offline_terminal_summary_emits_no_live_telemetry() -> None:
+    config = _FakeConfig()
+    config._jarvis_live_session_report = False
+    config._jarvis_live_session_telemetry = [
+        LiveRequestEvent(
+            test_identifier="LIVE-SCENARIO",
+            method="GET",
+            host="cad.onshape.com",
+            route="/api/v9/documents/{documentId}",
+            test_used=1,
+            test_limit=3,
+            suite_used=1,
+            suite_limit=30,
+            blocked_scope="none",
+        )
+    ]
+    reporter = _FakeTerminalReporter()
+
+    pytest_terminal_summary(reporter, 0, config)
+
+    assert reporter.lines == []
+
+
+def test_enabled_terminal_summary_emits_only_sanitized_events_and_exact_totals() -> None:
+    config = _FakeConfig()
+    config._jarvis_live_session_report = True
+    config._jarvis_live_session_telemetry = [
+        LiveRequestEvent(
+            test_identifier="LIVE-DEEP-READ-01",
+            method="GET",
+            host="cad.onshape.com",
+            route="/api/v9/documents/d/{documentId}",
+            test_used=1,
+            test_limit=1,
+            suite_used=1,
+            suite_limit=30,
+            blocked_scope="none",
+        ),
+        LiveRequestEvent(
+            test_identifier="LIVE-SCENARIO",
+            method="GET",
+            host="cad.onshape.com",
+            route="/api/v9/documents/d/{documentId}",
+            test_used=1,
+            test_limit=1,
+            suite_used=1,
+            suite_limit=30,
+            blocked_scope="test",
+        ),
+    ]
+    reporter = _FakeTerminalReporter()
+
+    pytest_terminal_summary(reporter, 0, config)
+
+    assert reporter.lines == [
+        "live request telemetry",
+        "LIVE-DEEP-READ-01 GET cad.onshape.com /api/v9/documents/d/{documentId} "
+        "test=1/1 suite=1/30 blocked=none",
+        "LIVE-SCENARIO GET cad.onshape.com /api/v9/documents/d/{documentId} "
+        "test=1/1 suite=1/30 blocked=test",
+        "physical_sends=1 blocked_attempts=1",
+    ]
+    output = "\n".join(reporter.lines)
+    for poison in (
+        "private-document-canary",
+        "private-access-canary",
+        "Authorization",
+        "secret=query-canary",
+        "response-body-canary",
+    ):
+        assert poison not in output
+
+
+def test_live_session_telemetry_fixture_returns_plugin_owned_list() -> None:
+    config = _FakeConfig()
+    config._jarvis_live_session_telemetry = []
+
+    assert live_session_telemetry.__wrapped__(config) is config._jarvis_live_session_telemetry
+
+
+def test_live_report_flag_requires_positive_selection_and_valid_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_readonly_live(monkeypatch)
+    item = _FakeLiveItem()
+
+    offline_config = _FakeConfig()
+    offline_config.option = SimpleNamespace(markexpr="not live_onshape", numprocesses=0)
+    offline_config._jarvis_live_session_report = False
+    pytest_collection_modifyitems(offline_config, [item])
+    assert offline_config._jarvis_live_session_report is False
+
+    invalid_config = _FakeConfig()
+    invalid_config.option = SimpleNamespace(markexpr="live_onshape", numprocesses=0)
+    invalid_config._jarvis_live_session_report = False
+    monkeypatch.delenv("ONSHAPE_SECRET_KEY")
+    with pytest.raises(pytest.UsageError, match="LIVE_CREDENTIALS_INVALID"):
+        pytest_collection_modifyitems(invalid_config, [item])
+    assert invalid_config._jarvis_live_session_report is False
+
+    valid_config = _FakeConfig()
+    valid_config.option = SimpleNamespace(markexpr="live_onshape", numprocesses=0)
+    valid_config._jarvis_live_session_report = False
+    monkeypatch.setenv("ONSHAPE_SECRET_KEY", "secret-canary")
+    pytest_collection_modifyitems(valid_config, [item])
+    assert valid_config._jarvis_live_session_report is True
 
 
 def test_selected_live_readonly_test_reaches_setup_when_fully_configured(

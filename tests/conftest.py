@@ -25,12 +25,33 @@ def pytest_configure(config):
     network_patches = pytest.MonkeyPatch()
     install_network_guard(network_patches)
     config._jarvis_network_patches = network_patches
+    config._jarvis_live_session_telemetry = []
+    config._jarvis_live_session_report = False
 
 
 def pytest_unconfigure(config):
     network_patches = getattr(config, "_jarvis_network_patches", None)
     if network_patches is not None:
         network_patches.undo()
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not config._jarvis_live_session_report:
+        return
+    events = config._jarvis_live_session_telemetry
+    terminalreporter.section("live request telemetry")
+    for event in events:
+        terminalreporter.write_line(
+            f"{event.test_identifier} {event.method} {event.host} {event.route} "
+            f"test={event.test_used}/{event.test_limit} "
+            f"suite={event.suite_used}/{event.suite_limit} "
+            f"blocked={event.blocked_scope}"
+        )
+    physical_sends = sum(event.blocked_scope == "none" for event in events)
+    blocked_attempts = len(events) - physical_sends
+    terminalreporter.write_line(
+        f"physical_sends={physical_sends} blocked_attempts={blocked_attempts}"
+    )
 
 
 def _parse_marker_expression(markexpr):
@@ -122,6 +143,7 @@ def pytest_collection_modifyitems(config, items):
         load_live_config()
     except LiveConfigurationError as error:
         _fail(str(error))
+    config._jarvis_live_session_report = True
     if os.getenv("JARVIS_LIVE_MUTATIONS") != "1":
         for item in live_items:
             if item.get_closest_marker("live_mutation"):
@@ -168,8 +190,8 @@ def live_model_ids(live_config):
 
 
 @pytest.fixture(scope="session")
-def live_session_telemetry():
-    return []
+def live_session_telemetry(pytestconfig):
+    return pytestconfig._jarvis_live_session_telemetry
 
 
 @pytest_asyncio.fixture
