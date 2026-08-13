@@ -213,12 +213,26 @@ Face/edge IDs are strings like `JHK`, `JNC`, `JHl`. Drop them verbatim into tool
 
 ## The regen-check protocol
 
-`apply_feature_and_check` (used by every mutating tool) returns `{ok, status, feature_id, feature_name, error_message}`. Interpret:
+Part Studio mutations return status plus `transport_ok`, `http_ok`,
+`regen_ok`, `mutation_verification`, `changed`, `reason_code`, and
+`verification_message`. Interpret them together:
 
-- `status == "OK"` → feature built cleanly.
-- `status == "INFO"` → Onshape auto-adjusted something. `ok=True` but READ `error_message`: common notes include "extrude was through-all auto-clamped" (fine) and "nothing was cut" (bad — you probably got the extrude direction wrong).
-- `status == "WARNING"` → feature built but Onshape is concerned. Read and decide.
-- `status == "ERROR"` → feature did not build. Do NOT add more features on top of it. Either fix the parameters and re-POST via `update_feature`, or `delete_feature_by_name` and retry.
+- `ok == true` means the transport was accepted, the authoritative reread has
+  an `OK`/`INFO` regeneration state, and the safely comparable requested CAD
+  fields were verified. It does not mean merely “HTTP 2xx.”
+- `mutation_verification == "no_effect"` means the requested state was already
+  present or remained unchanged. Check feature and parameter IDs before retrying.
+- `mutation_verification == "unverified"` means transport may have succeeded,
+  but Jarvis could not compare the requested state defensibly (for example,
+  server canonicalization or a missing authoritative status). Inspect before
+  building on top of it.
+- `mutation_verification == "failed"` or `regen_ok == false` means a stable
+  mismatch or Onshape regeneration error was observed. Fix or remove the
+  feature before adding dependents.
+- `status == "UNKNOWN"` never proves regeneration success.
+
+The complete raw Onshape response is internal evidence and is not emitted in
+normal MCP mutation results.
 
 Mate handlers (`create_fastened_mate` / `create_revolute_mate` / `create_slider_mate` / `create_cylindrical_mate` / `create_mate_connector`) share the same `{ok, status, ...}` contract via `apply_assembly_feature_and_check`. A mate that silently flips an instance still shows up as `status="ERROR"` or `"WARNING"` on the mate-level response — no need to visually check every mate just to catch a solver rejection. The 4-mate-for-2-part bracket dogfood burned ~50 turns to the now-fixed prose-return of this path.
 
@@ -274,9 +288,14 @@ Tool responses now include a `hints` list that points at this section; don't ign
 
 **Minimal template** (copy, adapt, pass as `featureScript` to `write_featurescript_feature`):
 
+Replace `N` below with the current standard-library version. Jarvis discovers
+that version and rejects a stale prelude or `onshape/std/...` import before it
+creates/uploads a Feature Studio. Custom, workspace, linked-document, Part
+Studio, and data imports keep their own reference or microversion semantics.
+
 ```
-FeatureScript 2909;
-import(path : "onshape/std/geometry.fs", version : "2909.0");
+FeatureScript N;
+import(path : "onshape/std/geometry.fs", version : "N.0");
 
 annotation { "Feature Type Name" : "My Custom Feature" }
 export const myCustomFeature = defineFeature(function(context is Context, id is Id, definition is map)

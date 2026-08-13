@@ -2,7 +2,11 @@
 
 import pytest
 
-from onshape_mcp.builders.revolve import RevolveType, RevolveBuilder
+from onshape_mcp.builders.revolve import (
+    RevolveBuilder,
+    RevolveType,
+    UnsupportedOnshapePayloadError,
+)
 
 
 class TestRevolveType:
@@ -77,67 +81,14 @@ class TestRevolveBuilder:
         with pytest.raises(ValueError, match="Sketch feature ID must be set"):
             revolve.build()
 
-    def test_build_structure(self):
-        revolve = RevolveBuilder(name="TestRevolve", sketch_feature_id="sketch1")
-        result = revolve.build()
+    @pytest.mark.parametrize("axis", ["X", "Y", "Z"])
+    def test_build_rejects_unresolved_datum_axis_payload(self, axis):
+        revolve = RevolveBuilder(sketch_feature_id="sketch1", axis=axis)
 
-        assert result["btType"] == "BTFeatureDefinitionCall-1406"
-        feature = result["feature"]
-        assert feature["btType"] == "BTMFeature-134"
-        assert feature["featureType"] == "revolve"
-        assert feature["name"] == "TestRevolve"
+        with pytest.raises(UnsupportedOnshapePayloadError) as exc:
+            revolve.build()
 
-    def test_build_entities_parameter(self):
-        revolve = RevolveBuilder(sketch_feature_id="sketch1")
-        result = revolve.build()
-        params = result["feature"]["parameters"]
-
-        entities = next(p for p in params if p["parameterId"] == "entities")
-        assert entities["queries"][0]["btType"] == "BTMIndividualSketchRegionQuery-140"
-        assert "sketch1" in entities["queries"][0]["queryString"]
-
-    def test_build_axis_mapping(self):
-        for axis, expected in [("X", "RIGHT"), ("Y", "TOP"), ("Z", "FRONT")]:
-            revolve = RevolveBuilder(sketch_feature_id="s1", axis=axis)
-            result = revolve.build()
-            params = result["feature"]["parameters"]
-            axis_param = next(p for p in params if p["parameterId"] == "axis")
-            assert expected in axis_param["queries"][0]["queryString"]
-
-    def test_build_angle_without_variable(self):
-        revolve = RevolveBuilder(sketch_feature_id="s1", angle=180.0)
-        result = revolve.build()
-        params = result["feature"]["parameters"]
-
-        angle_param = next(p for p in params if p["parameterId"] == "revolveAngle")
-        assert angle_param["expression"] == "180.0 deg"
-        assert angle_param["value"] == 180.0
-
-    def test_build_angle_with_variable(self):
-        revolve = RevolveBuilder(sketch_feature_id="s1")
-        revolve.set_angle(90.0, variable_name="a")
-        result = revolve.build()
-        params = result["feature"]["parameters"]
-
-        angle_param = next(p for p in params if p["parameterId"] == "revolveAngle")
-        assert angle_param["expression"] == "#a"
-
-    def test_build_operation_types(self):
-        for op in RevolveType:
-            revolve = RevolveBuilder(sketch_feature_id="s1", operation_type=op)
-            result = revolve.build()
-            params = result["feature"]["parameters"]
-            op_param = next(p for p in params if p["parameterId"] == "operationType")
-            assert op_param["value"] == op.value
-
-    def test_build_opposite_direction(self):
-        revolve = RevolveBuilder(sketch_feature_id="s1")
-        revolve.set_opposite_direction(True)
-        result = revolve.build()
-        params = result["feature"]["parameters"]
-
-        opp_param = next(p for p in params if p["parameterId"] == "oppositeDirection")
-        assert opp_param["value"] is True
+        assert exc.value.reason_code == "UNSUPPORTED_CURRENT_ONSHAPE_PAYLOAD"
 
     def test_method_chaining(self):
         revolve = (

@@ -1,15 +1,9 @@
 """Paradigm-level tool surface: author a FeatureScript custom feature and
 instantiate it in a Part Studio in one call.
 
-STATUS 2026-04-16: unblocked by FS research round 2 (see
-`scratchpad/fs-custom-feature-research-2.md`). Three fixes applied vs the
-earlier wip:
-
-1. FS version bumped from stale 2242 to current 2909 (667 versions of
-   drift was silently compiling every upload to an empty symbol table).
-2. Namespace format corrected to `e{fs_eid}::m{microversion}` — letter
+Namespace format is `e{fs_eid}::m{microversion}` — letter
    prefixes glued directly to ids, no `::` between prefix and id.
-3. Microversion fetched from `/featurespecs` after upload (the
+Microversion is fetched from `/featurespecs` after upload (the
    `sourceMicroversionId` field on each entry) instead of guessing.
 
 The inline "paste a FS snippet and run it" path does not exist in
@@ -48,20 +42,28 @@ from .feature_apply import FeatureApplyResult, apply_feature_and_check
 from .fs_notices import extract_fs_body, fetch_body_notices, format_notices
 
 
-# Current FS language version. The SAME number must appear in the uploaded
-# source's `FeatureScript <N>;` prelude AND every `import(..., version : "<N>.0")`
-# statement. Bump this when Onshape ships a newer std library — or call
-# `discover_fs_version()` at runtime to pull the live value.
-# 2931 verified via peer e288nu7l's FS-frontier dogfood (threaded boss); 2909
-# was stale by 22 versions as of 2026-04-17.
-DEFAULT_FS_VERSION = "2931"
-
 # Onshape's public standard library document. Latest version entry = current
 # FS library version. See `discover_fs_version()`.
 _ONSHAPE_STD_DID = "12312312345abcabcabcdeff"
 
 
 _VALID_FEATURE_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FS_PRELUDE_RE = re.compile(r"\A\s*FeatureScript\s+(\d+)\s*;")
+_FS_IMPORT_RE = re.compile(r"\bimport\s*\(([^)]*)\)\s*;", re.DOTALL)
+_FS_PATH_RE = re.compile(r'\bpath\s*:\s*"([^"]+)"')
+_FS_VERSION_RE = re.compile(r'\bversion\s*:\s*"([^"]+)"')
+
+
+class FeatureScriptVersionError(ValueError):
+    """Source version cannot be safely used with the current std library."""
+
+    reason_code = "FEATURESCRIPT_VERSION_MISMATCH"
+
+
+class FeatureScriptVersionDiscoveryError(RuntimeError):
+    """The current std-library version could not be established."""
+
+    reason_code = "FEATURESCRIPT_VERSION_DISCOVERY_FAILED"
 
 
 class CustomFeatureManager:
@@ -69,6 +71,7 @@ class CustomFeatureManager:
 
     def __init__(self, client: OnshapeClient):
         self.client = client
+        self._std_version_cache: Optional[str] = None
 
     # ---- FS version discovery --------------------------------------------
 
@@ -76,8 +79,8 @@ class CustomFeatureManager:
         """Query the live FS library version from Onshape's public std doc.
 
         Returns the integer version string (e.g. "2909"). Useful when you
-        suspect DEFAULT_FS_VERSION is stale; pin the result and reuse. Does
-        NOT cache — callers should cache themselves if they care.
+        need the current standard-library generation. The manager-level
+        preflight caches this value for the lifetime of the manager.
         """
         versions = await self.client.get(
             f"/api/v9/documents/d/{_ONSHAPE_STD_DID}/versions"
@@ -98,6 +101,65 @@ class CustomFeatureManager:
         raise RuntimeError(
             f"could not parse FS version from std versions list: {versions!r}"
         )
+
+    async def validate_featurescript_source(self, source: str) -> str:
+        """Validate prelude and std imports before any Feature Studio write."""
+
+        if self._std_version_cache is None:
+            try:
+                self._std_version_cache = await self.discover_fs_version()
+            except Exception as error:  # noqa: BLE001
+                raise FeatureScriptVersionDiscoveryError(
+                    f"FeatureScript std-library version discovery failed: {error}"
+                ) from error
+        expected = self._std_version_cache
+
+        prelude = _FS_PRELUDE_RE.search(source)
+        if prelude is None:
+            raise FeatureScriptVersionError(
+                f"FeatureScript source must start with `FeatureScript {expected};`."
+            )
+        supplied = prelude.group(1)
+        if supplied != expected:
+            raise FeatureScriptVersionError(
+                f"FeatureScript prelude version {supplied} does not match discovered "
+                f"standard-library version {expected}."
+            )
+
+        import_matches = list(_FS_IMPORT_RE.finditer(source))
+        for import_match in import_matches:
+            import_body = import_match.group(1)
+            path_match = _FS_PATH_RE.search(import_body)
+            if path_match is None:
+                continue
+            import_path = path_match.group(1).replace("\\", "/").lstrip("/")
+            if not import_path.startswith("onshape/std/"):
+                continue
+            version_match = _FS_VERSION_RE.search(import_body)
+            if version_match is None:
+                raise FeatureScriptVersionError(
+                    f"Standard-library import {import_path!r} has no version."
+                )
+            import_version = version_match.group(1).strip()
+            if import_version not in {expected, f"{expected}.0"}:
+                raise FeatureScriptVersionError(
+                    f"Standard-library import {import_path!r} uses version "
+                    f"{import_version!r}; expected {expected!r} or {expected + '.0'!r}."
+                )
+        matched_starts = {match.start() for match in import_matches}
+        for import_start in re.finditer(r"\bimport\s*\(", source):
+            if import_start.start() in matched_starts:
+                continue
+            line_end = source.find("\n", import_start.start())
+            fragment = source[
+                import_start.start() : None if line_end < 0 else line_end
+            ]
+            if "onshape/std/" in fragment.replace("\\", "/"):
+                raise FeatureScriptVersionError(
+                    "Malformed standard-library import; expected a complete "
+                    '`import(path:"onshape/std/...", version:"N.0");` statement.'
+                )
+        return expected
 
     # ---- Feature Studio element lifecycle ---------------------------------
 
@@ -245,6 +307,7 @@ class CustomFeatureManager:
         a top-level name equal to `feature_type`. The worked example in the
         tool description shows the minimum boilerplate.
         """
+        await self.validate_featurescript_source(feature_script)
         fs_name = fs_element_name or f"ClaudeFS_{feature_type}"
         fs_eid = await self.create_feature_studio(
             document_id, workspace_id, fs_name
@@ -262,11 +325,8 @@ class CustomFeatureManager:
         if not feature_specs:
             raise RuntimeError(
                 f"Feature Studio {fs_eid} compiled to an empty feature spec. "
-                f"Likely causes: stale FeatureScript prelude version (try "
-                f"discover_fs_version() and confirm DEFAULT_FS_VERSION={DEFAULT_FS_VERSION!r} "
-                f"is current), or a syntax error. libraryVersion="
-                f"{specs.get('libraryVersion')!r}. Uploaded source preview: "
-                f"{feature_script[:200]!r}"
+                f"Likely cause: a FeatureScript syntax or export error. "
+                f"libraryVersion={specs.get('libraryVersion')!r}."
             )
         # Pick the spec whose exported `featureType` matches the caller's,
         # else fall back to the first. BTFeatureSpec-129 keys live at the
@@ -285,7 +345,7 @@ class CustomFeatureManager:
         if not source_microversion:
             raise RuntimeError(
                 f"Could not extract sourceMicroversionId from featurespecs. "
-                f"Spec entry keys: {list(msg.keys())}; upload_resp keys: "
+                f"Spec entry keys: {list(target_spec.keys())}; upload_resp keys: "
                 f"{list(upload_resp.keys())}"
             )
 
