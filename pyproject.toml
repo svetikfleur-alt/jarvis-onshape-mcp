@@ -61,10 +61,6 @@ addopts = [
     "-v",
     "-ra",
     "--strict-markers",
-    "--cov=onshape_mcp",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml",
 ]
 markers = [
     "asyncio: marks tests as async",

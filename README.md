@@ -162,11 +162,145 @@ docs to read.
 git clone https://github.com/ReshefElisha/jarvis-onshape-mcp
 cd jarvis-onshape-mcp
 uv sync
-export ONSHAPE_API_KEY=...
-export ONSHAPE_API_SECRET=...
 uv run onshape-mcp         # launch the MCP server on stdio
-uv run pytest              # unit tests
+uv run pytest -m "not live_onshape"  # credential-free offline tests
 ```
+
+### Offline tests and local live acceptance
+
+Normal pytest runs and CI are credential-free and offline. Pytest blocks
+unguarded socket and DNS access, and CI explicitly excludes `live_onshape`.
+Coverage is opt-in so focused development runs stay fast.
+
+```bash
+# Fast offline suite
+python -m pytest -m "not live_onshape" -q --maxfail=1
+
+# Focused harness policy tests
+python -m pytest tests/test_test_harness.py -q --maxfail=1
+
+# Explicit offline branch-coverage gate
+python -m pytest -m "not live_onshape" --cov=onshape_mcp --cov-branch --cov-report=term-missing --cov-fail-under=80
+```
+
+Live acceptance is local-only and fail-fast. It requires exactly one complete
+credential pair: `ONSHAPE_API_KEY` plus `ONSHAPE_API_SECRET`, or
+`ONSHAPE_ACCESS_KEY` plus `ONSHAPE_SECRET_KEY`. It also requires
+`JARVIS_LIVE_DOCUMENT_ID`, `JARVIS_LIVE_WORKSPACE_ID`, and
+`JARVIS_LIVE_ELEMENT_ID`. Replace every angle-bracket placeholder below; the
+commands never print those values. Read-only tests default to 3 physical sends,
+mutation tests to 8, and the suite to `JARVIS_LIVE_SUITE_BUDGET=30`; a
+`live_budget(N)` marker may only lower the per-test limit. Execution must remain
+serial because all network access goes through the serial guarded transport.
+
+For Bash, define this fail-fast helper once:
+
+```bash
+run_local_live() (
+  set -euo pipefail
+  marker=$1
+  mutation_opt_in=$2
+  api_pair=0
+  access_pair=0
+
+  if [[ -n "${ONSHAPE_API_KEY:-}" || -n "${ONSHAPE_API_SECRET:-}" ]]; then
+    [[ -n "${ONSHAPE_API_KEY:-}" && -n "${ONSHAPE_API_SECRET:-}" ]] || {
+      echo "The API credential pair is incomplete" >&2; exit 2;
+    }
+    api_pair=1
+  fi
+  if [[ -n "${ONSHAPE_ACCESS_KEY:-}" || -n "${ONSHAPE_SECRET_KEY:-}" ]]; then
+    [[ -n "${ONSHAPE_ACCESS_KEY:-}" && -n "${ONSHAPE_SECRET_KEY:-}" ]] || {
+      echo "The access credential pair is incomplete" >&2; exit 2;
+    }
+    access_pair=1
+  fi
+  [[ $((api_pair + access_pair)) -eq 1 ]] || {
+    echo "Configure exactly one complete credential pair" >&2; exit 2;
+  }
+  for name in JARVIS_LIVE_DOCUMENT_ID JARVIS_LIVE_WORKSPACE_ID JARVIS_LIVE_ELEMENT_ID; do
+    [[ -n "${!name:-}" ]] || { echo "Missing required live sandbox ID" >&2; exit 2; }
+  done
+
+  JARVIS_LIVE_TESTS=1 JARVIS_LIVE_MUTATIONS="$mutation_opt_in" JARVIS_LIVE_SUITE_BUDGET=30 \
+    python -m pytest -m "$marker" -q --maxfail=1
+)
+```
+
+Then run exactly one local command. The assignments are scoped to that command:
+
+```bash
+# Read-only
+ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>' \
+JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>' \
+JARVIS_LIVE_ELEMENT_ID='<element-id>' \
+run_local_live 'live_onshape and live_readonly' 0
+
+# Mutation harness contract (no WP-003 scenario is collected)
+ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>' \
+JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>' \
+JARVIS_LIVE_ELEMENT_ID='<element-id>' \
+run_local_live 'live_onshape and live_mutation' 1
+```
+
+For PowerShell, use this helper; `finally` restores every process variable and
+the final `exit $exitCode` propagates pytest failure:
+
+```powershell
+function Invoke-LocalLive {
+  param(
+    [string]$Marker, [string]$MutationOptIn,
+    [string]$ApiKey, [string]$ApiSecret, [string]$AccessKey, [string]$SecretKey,
+    [string]$DocumentId, [string]$WorkspaceId, [string]$ElementId
+  )
+  $names = @(
+    'ONSHAPE_API_KEY', 'ONSHAPE_API_SECRET', 'ONSHAPE_ACCESS_KEY', 'ONSHAPE_SECRET_KEY',
+    'JARVIS_LIVE_DOCUMENT_ID', 'JARVIS_LIVE_WORKSPACE_ID', 'JARVIS_LIVE_ELEMENT_ID',
+    'JARVIS_LIVE_TESTS', 'JARVIS_LIVE_MUTATIONS', 'JARVIS_LIVE_SUITE_BUDGET'
+  )
+  $prior = @{}
+  foreach ($name in $names) { $prior[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+  $exitCode = 1
+  try {
+    $env:ONSHAPE_API_KEY = $ApiKey; $env:ONSHAPE_API_SECRET = $ApiSecret
+    $env:ONSHAPE_ACCESS_KEY = $AccessKey; $env:ONSHAPE_SECRET_KEY = $SecretKey
+    $env:JARVIS_LIVE_DOCUMENT_ID = $DocumentId; $env:JARVIS_LIVE_WORKSPACE_ID = $WorkspaceId
+    $env:JARVIS_LIVE_ELEMENT_ID = $ElementId
+    $apiComplete = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_KEY) -and -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_SECRET)
+    $accessComplete = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_ACCESS_KEY) -and -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_SECRET_KEY)
+    if ([int]$apiComplete + [int]$accessComplete -ne 1) { throw 'Configure exactly one complete credential pair' }
+    foreach ($name in @('JARVIS_LIVE_DOCUMENT_ID','JARVIS_LIVE_WORKSPACE_ID','JARVIS_LIVE_ELEMENT_ID')) {
+      if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name").Value)) { throw 'Missing required live sandbox ID' }
+    }
+    $env:JARVIS_LIVE_TESTS = '1'; $env:JARVIS_LIVE_MUTATIONS = $MutationOptIn
+    $env:JARVIS_LIVE_SUITE_BUDGET = '30'
+    python -m pytest -m $Marker -q --maxfail=1
+    $exitCode = $LASTEXITCODE
+  } finally {
+    foreach ($name in $names) {
+      if ($null -eq $prior[$name]) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+      else { Set-Item "Env:$name" $prior[$name] }
+    }
+  }
+  if ($exitCode -ne 0) { exit $exitCode }
+}
+```
+
+```powershell
+# Read-only
+Invoke-LocalLive -Marker 'live_onshape and live_readonly' -MutationOptIn '0' `
+  -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
+  -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
+
+# Mutation harness contract (no WP-003 scenario is collected)
+Invoke-LocalLive -Marker 'live_onshape and live_mutation' -MutationOptIn '1' `
+  -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
+  -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
+```
+
+WP-003 ships no live mutation scenario. The mutation command documents the
+guarded harness contract only; it does not authorize mutation or cause a live
+test to exist.
 
 ## Attribution
 
