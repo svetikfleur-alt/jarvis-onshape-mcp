@@ -21,10 +21,12 @@ import io
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
+import httpx
 from loguru import logger
 from PIL import Image
 
 from .client import OnshapeClient
+from .request_guard import sanitize_request
 
 
 # Onshape /shadedviews accepts these named view strings in the viewMatrix
@@ -239,7 +241,8 @@ class ShadedViewManager:
             "pixelSize": pixel_size,
             "edges": "true" if edges else "false",
         }
-        logger.debug(f"render {view}: GET {base_path} {params}")
+        request = sanitize_request("GET", httpx.URL(base_path))
+        logger.debug("render request: {} {}", request.method, request.route)
         resp = await self.client.get(base_path, params=params)
         images = resp.get("images") or []
         if not images:

@@ -1,6 +1,7 @@
 """Safe accounting for live HTTP requests at the supported HTTPX boundary."""
 
 import re
+from http import HTTPStatus
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -94,6 +95,32 @@ class RequestDescriptor:
         return self.path
 
 
+@dataclass(frozen=True)
+class SafeHttpDiagnostic:
+    """Bounded HTTP failure metadata safe for logs and tool output."""
+
+    error_class: str
+    status_code: Optional[int]
+    reason_phrase: Optional[str]
+    content_length: Optional[int]
+    method: str
+    host: str
+    route: str
+
+    def __str__(self) -> str:
+        fields = [
+            f"error={self.error_class}",
+            f"request={self.method} {self.host}{self.route}",
+        ]
+        if self.status_code is not None:
+            fields.append(f"status={self.status_code}")
+        if self.reason_phrase:
+            fields.append(f"reason={self.reason_phrase}")
+        if self.content_length is not None:
+            fields.append(f"content_length={self.content_length}")
+        return "; ".join(fields)
+
+
 BlockedScope = Literal["none", "test", "suite", "test_and_suite"]
 
 
@@ -166,6 +193,55 @@ def sanitize_request(method: str, url: httpx.URL) -> RequestDescriptor:
         method=normalized_method,
         host=url.host or "{unknown}",
         path="/" + "/".join(sanitized),
+    )
+
+
+def _standard_reason_phrase(status_code: int) -> Optional[str]:
+    """Return the standard library's phrase, never server-controlled text."""
+    try:
+        return HTTPStatus(status_code).phrase[:80]
+    except ValueError:
+        return None
+
+
+def _declared_content_length(response: object) -> Optional[int]:
+    """Read only a bounded numeric Content-Length header, never the body."""
+    if not isinstance(response, httpx.Response):
+        return None
+    value = response.headers.get("Content-Length")
+    if value is None or re.fullmatch(r"\d{1,20}", value) is None:
+        return None
+    return int(value)
+
+
+def safe_http_diagnostic(error: httpx.HTTPError) -> SafeHttpDiagnostic:
+    """Describe an HTTPX failure without retaining raw URLs or payloads."""
+    request: object = None
+    try:
+        request = error.request
+    except RuntimeError:
+        pass
+
+    descriptor = (
+        sanitize_request(request.method, request.url)
+        if isinstance(request, httpx.Request)
+        else RequestDescriptor(method="UNKNOWN", path="/{opaque}")
+    )
+    response = error.response if isinstance(error, httpx.HTTPStatusError) else None
+    status_code = None
+    reason_phrase = None
+    if isinstance(response, httpx.Response):
+        status_code = response.status_code
+        reason_phrase = _standard_reason_phrase(status_code)
+
+    return SafeHttpDiagnostic(
+        error_class=type(error).__name__,
+        status_code=status_code,
+        reason_phrase=reason_phrase,
+        content_length=_declared_content_length(response),
+        method=descriptor.method,
+        host=descriptor.host,
+        route=descriptor.route,
     )
 
 

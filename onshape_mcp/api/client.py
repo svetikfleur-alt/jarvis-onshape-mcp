@@ -6,14 +6,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from loguru import logger
 
-from .request_guard import RequestDescriptor, sanitize_request
-
-
-def _safe_status_descriptor(request: object) -> RequestDescriptor:
-    """Build a diagnostic descriptor without retaining request URL details."""
-    if isinstance(request, httpx.Request):
-        return sanitize_request(request.method, request.url)
-    return RequestDescriptor(method="UNKNOWN", path="/{opaque}")
+from .request_guard import safe_http_diagnostic
 
 
 def _raise_for_status(response: httpx.Response) -> None:
@@ -21,11 +14,9 @@ def _raise_for_status(response: httpx.Response) -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
-        descriptor = _safe_status_descriptor(error.request)
-        status = response.status_code if isinstance(response.status_code, int) else "unknown"
+        diagnostic = safe_http_diagnostic(error)
         raise httpx.HTTPStatusError(
-            f"Onshape API request failed: status={status}; "
-            f"request={descriptor.method} {descriptor.path}",
+            f"Onshape API request failed: {diagnostic}",
             request=error.request,
             response=error.response,
         ) from None

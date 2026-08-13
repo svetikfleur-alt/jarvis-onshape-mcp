@@ -19,6 +19,7 @@ _package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_package_dir, ".env"))
 
 from .api.client import OnshapeClient, OnshapeCredentials
+from .api.request_guard import safe_http_diagnostic
 from .api.partstudio import PartStudioManager
 from .api.variables import VariableManager
 from .api.documents import DocumentManager
@@ -2807,6 +2808,21 @@ def _feature_apply_json(
     return json.dumps(payload, indent=2)
 
 
+def _safe_exception_message(error: BaseException) -> str:
+    """Preserve normal errors while sanitizing HTTPX exception strings."""
+    if isinstance(error, httpx.HTTPError):
+        return str(safe_http_diagnostic(error))
+    return str(error)
+
+
+def _log_unexpected_error(message: str, error: BaseException) -> None:
+    """Avoid traceback formatting only when it would stringify an HTTP error."""
+    if isinstance(error, httpx.HTTPError):
+        logger.error("{}: {}", message, safe_http_diagnostic(error))
+    else:
+        logger.exception(message)
+
+
 # Standard datum plane deterministic ids. Anything else in a sketch's
 # `sketchPlane` parameter signals the sketch was placed on a picked face.
 _STANDARD_PLANE_IDS = frozenset({"JCC", "JDC", "JEC"})
@@ -2899,8 +2915,14 @@ def _exception_json(
     tree's current state -- an exception here usually means the feature
     wasn't even attempted on Onshape's side, so the prior state is intact.
     """
-    msg = str(error)
-    if status_code is not None:
+    if isinstance(error, httpx.HTTPError):
+        diagnostic = safe_http_diagnostic(error)
+        msg = str(diagnostic)
+        if status_code is not None and diagnostic.status_code is None:
+            msg = f"HTTP {status_code}: {msg}"
+    else:
+        msg = str(error)
+    if status_code is not None and not isinstance(error, httpx.HTTPError):
         msg = f"HTTP {status_code}: {msg}"
     payload: dict[str, Any] = {
         "ok": False,
@@ -3111,7 +3133,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating sketch rectangle")
+            _log_unexpected_error("Unexpected error creating sketch rectangle", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_rounded_rectangle_sketch":
@@ -3136,7 +3158,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating rounded rectangle sketch")
+            _log_unexpected_error("Unexpected error creating rounded rectangle sketch", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_extrude":
@@ -3228,10 +3250,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 result, tool_name=name, notes=notes,
             ))]
         except httpx.HTTPStatusError as e:
-            logger.error(f"API error creating extrude: {e.response.status_code} - {e.response.text[:500]}")
+            logger.error("API error creating extrude: {}", safe_http_diagnostic(e))
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating extrude")
+            _log_unexpected_error("Unexpected error creating extrude", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_thicken":
@@ -3267,10 +3289,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 tool_name=name,
             ))]
         except httpx.HTTPStatusError as e:
-            logger.error(f"API error creating thicken: {e.response.status_code} - {e.response.text[:500]}")
+            logger.error("API error creating thicken: {}", safe_http_diagnostic(e))
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating thicken")
+            _log_unexpected_error("Unexpected error creating thicken", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "get_variables":
@@ -3298,9 +3320,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"API error getting variables: {e.response.status_code} - {e.response.text[:500]}"
-            )
+            logger.error("API error getting variables: {}", safe_http_diagnostic(e))
             return [
                 TextContent(
                     type="text",
@@ -3308,11 +3328,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting variables")
+            _log_unexpected_error("Unexpected error getting variables", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting variables: {str(e)}",
+                    text=f"Error getting variables: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -3334,9 +3354,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"API error creating Variable Studio: {e.response.status_code} - {e.response.text[:500]}"
-            )
+            logger.error("API error creating Variable Studio: {}", safe_http_diagnostic(e))
             return [
                 TextContent(
                     type="text",
@@ -3344,11 +3362,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error creating Variable Studio")
+            _log_unexpected_error("Unexpected error creating Variable Studio", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error creating Variable Studio: {str(e)}",
+                    text=f"Error creating Variable Studio: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -3375,9 +3393,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"API error setting variable: {e.response.status_code} - {e.response.text[:500]}"
-            )
+            logger.error("API error setting variable: {}", safe_http_diagnostic(e))
             hint = ""
             if e.response.status_code == 404:
                 hint = (
@@ -3394,11 +3410,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error setting variable")
+            _log_unexpected_error("Unexpected error setting variable", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error setting variable: {str(e)}",
+                    text=f"Error setting variable: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -3427,9 +3443,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             if record is not None:
                 context_store.delete(record.working_state.context_handle)
-            logger.error(
-                f"API error starting model context: {e.response.status_code} - {e.response.text[:500]}"
-            )
+            logger.error("API error starting model context: {}", safe_http_diagnostic(e))
             payload = {
                 "error": {
                     "type": "onshape_read_failed",
@@ -3437,10 +3451,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 }
             }
             return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
-        except Exception:
+        except Exception as e:
             if record is not None:
                 context_store.delete(record.working_state.context_handle)
-            logger.exception("Unexpected error starting model context")
+            _log_unexpected_error("Unexpected error starting model context", e)
             payload = {
                 "error": {
                     "type": "context_start_failed",
@@ -3891,9 +3905,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
             return [TextContent(type="text", text=f"Features data: {features}")]
         except httpx.HTTPStatusError as e:
-            logger.error(
-                f"API error getting features: {e.response.status_code} - {e.response.text[:500]}"
-            )
+            logger.error("API error getting features: {}", safe_http_diagnostic(e))
             return [
                 TextContent(
                     type="text",
@@ -3901,11 +3913,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting features")
+            _log_unexpected_error("Unexpected error getting features", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting features: {str(e)}",
+                    text=f"Error getting features: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -3936,7 +3948,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error deleting feature")
+            _log_unexpected_error("Unexpected error deleting feature", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "delete_feature_by_name":
@@ -3992,7 +4004,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error in delete_feature_by_name")
+            _log_unexpected_error("Unexpected error in delete_feature_by_name", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "update_feature":
@@ -4009,7 +4021,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error updating feature")
+            _log_unexpected_error("Unexpected error updating feature", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "list_documents":
@@ -4051,11 +4063,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error listing documents")
+            _log_unexpected_error("Unexpected error listing documents", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error listing documents: {str(e)}",
+                    text=f"Error listing documents: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4094,11 +4106,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error searching documents")
+            _log_unexpected_error("Unexpected error searching documents", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error searching documents: {str(e)}",
+                    text=f"Error searching documents: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4127,11 +4139,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting document")
+            _log_unexpected_error("Unexpected error getting document", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting document: {str(e)}",
+                    text=f"Error getting document: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4178,11 +4190,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting document summary")
+            _log_unexpected_error("Unexpected error getting document summary", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting document summary: {str(e)}",
+                    text=f"Error getting document summary: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4222,11 +4234,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error finding part studios")
+            _log_unexpected_error("Unexpected error finding part studios", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error finding part studios: {str(e)}",
+                    text=f"Error finding part studios: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4264,11 +4276,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting parts")
+            _log_unexpected_error("Unexpected error getting parts", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting parts: {str(e)}",
+                    text=f"Error getting parts: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4314,11 +4326,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting elements")
+            _log_unexpected_error("Unexpected error getting elements", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting elements: {str(e)}",
+                    text=f"Error getting elements: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4367,11 +4379,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error getting assembly")
+            _log_unexpected_error("Unexpected error getting assembly", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error getting assembly: {str(e)}",
+                    text=f"Error getting assembly: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4401,9 +4413,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                     if studios:
                         part_studio_id = studios[0].id
                         part_studio_name = studios[0].name
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "create_document: post-create workspace/elementId resolution failed"
+            except Exception as e:  # noqa: BLE001
+                _log_unexpected_error(
+                    "create_document: post-create workspace/elementId resolution failed", e
                 )
 
             payload: dict[str, Any] = {
@@ -4425,11 +4437,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            logger.exception("Unexpected error creating document")
+            _log_unexpected_error("Unexpected error creating document", e)
             return [
                 TextContent(
                     type="text",
-                    text=f"Error creating document: {str(e)}",
+                    text=f"Error creating document: {_safe_exception_message(e)}",
                 )
             ]
 
@@ -4451,16 +4463,16 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 "ok": False,
                 "status": "EXCEPTION",
                 "document_id": arguments["documentId"],
-                "error_message": f"HTTP {status_code}: {e}",
+                "error_message": f"HTTP {status_code}: {_safe_exception_message(e)}",
                 "tool": name,
             }, indent=2))]
         except Exception as e:
-            logger.exception("Unexpected error deleting document")
+            _log_unexpected_error("Unexpected error deleting document", e)
             return [TextContent(type="text", text=json.dumps({
                 "ok": False,
                 "status": "EXCEPTION",
                 "document_id": arguments["documentId"],
-                "error_message": str(e),
+                "error_message": _safe_exception_message(e),
                 "tool": name,
             }, indent=2))]
 
@@ -4512,18 +4524,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 "element_id": "",
                 "element_name": arguments.get("name", ""),
                 "other_part_studios": [],
-                "error_message": f"HTTP {e.response.status_code}: {e}",
+                "error_message": f"HTTP {e.response.status_code}: {_safe_exception_message(e)}",
                 "tool": name,
             }, indent=2))]
         except Exception as e:
-            logger.exception("Unexpected error creating Part Studio")
+            _log_unexpected_error("Unexpected error creating Part Studio", e)
             return [TextContent(type="text", text=json.dumps({
                 "ok": False,
                 "status": "EXCEPTION",
                 "element_id": "",
                 "element_name": arguments.get("name", ""),
                 "other_part_studios": [],
-                "error_message": str(e),
+                "error_message": _safe_exception_message(e),
                 "tool": name,
             }, indent=2))]
 
@@ -4547,7 +4559,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating assembly")
+            _log_unexpected_error("Unexpected error creating assembly", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "add_assembly_instance":
@@ -4591,7 +4603,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error adding instance")
+            _log_unexpected_error("Unexpected error adding instance", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "transform_instance":
@@ -4622,7 +4634,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error transforming instance")
+            _log_unexpected_error("Unexpected error transforming instance", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_fastened_mate":
@@ -4640,7 +4652,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating fastened mate")
+            _log_unexpected_error("Unexpected error creating fastened mate", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_revolute_mate":
@@ -4659,7 +4671,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating revolute mate")
+            _log_unexpected_error("Unexpected error creating revolute mate", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_slider_mate":
@@ -4678,7 +4690,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating slider mate")
+            _log_unexpected_error("Unexpected error creating slider mate", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_cylindrical_mate":
@@ -4697,7 +4709,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating cylindrical mate")
+            _log_unexpected_error("Unexpected error creating cylindrical mate", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_mate_connector":
@@ -4726,7 +4738,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating mate connector")
+            _log_unexpected_error("Unexpected error creating mate connector", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_sketch_circle":
@@ -4762,7 +4774,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating sketch circle")
+            _log_unexpected_error("Unexpected error creating sketch circle", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_sketch_line":
@@ -4782,7 +4794,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating sketch line")
+            _log_unexpected_error("Unexpected error creating sketch line", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_sketch_arc":
@@ -4818,7 +4830,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating sketch arc")
+            _log_unexpected_error("Unexpected error creating sketch arc", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_sketch":
@@ -4913,7 +4925,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating multi-entity sketch")
+            _log_unexpected_error("Unexpected error creating multi-entity sketch", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "edit_sketch":
@@ -4955,7 +4967,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error editing sketch")
+            _log_unexpected_error("Unexpected error editing sketch", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "inspect_sketch":
@@ -4994,7 +5006,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error inspecting sketch")
+            _log_unexpected_error("Unexpected error inspecting sketch", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "render_sketch":
@@ -5052,7 +5064,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error rendering sketch")
+            _log_unexpected_error("Unexpected error rendering sketch", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "list_sketches":
@@ -5081,7 +5093,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error listing sketches")
+            _log_unexpected_error("Unexpected error listing sketches", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_fillet":
@@ -5101,7 +5113,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating fillet")
+            _log_unexpected_error("Unexpected error creating fillet", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_chamfer":
@@ -5127,7 +5139,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating chamfer")
+            _log_unexpected_error("Unexpected error creating chamfer", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_shell":
@@ -5153,7 +5165,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating shell")
+            _log_unexpected_error("Unexpected error creating shell", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_offset_plane":
@@ -5192,7 +5204,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating offset plane")
+            _log_unexpected_error("Unexpected error creating offset plane", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_revolve":
@@ -5220,7 +5232,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating revolve")
+            _log_unexpected_error("Unexpected error creating revolve", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_linear_pattern":
@@ -5248,7 +5260,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating linear pattern")
+            _log_unexpected_error("Unexpected error creating linear pattern", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_circular_pattern":
@@ -5271,7 +5283,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating circular pattern")
+            _log_unexpected_error("Unexpected error creating circular pattern", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_boolean":
@@ -5297,7 +5309,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error creating boolean")
+            _log_unexpected_error("Unexpected error creating boolean", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "eval_featurescript":
@@ -5328,7 +5340,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error evaluating FeatureScript: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error evaluating FeatureScript: {str(e)}")]
+            return [TextContent(type="text", text=f"Error evaluating FeatureScript: {_safe_exception_message(e)}")]
 
     elif name == "get_bounding_box":
         try:
@@ -5341,7 +5353,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error getting bounding box: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error getting bounding box: {str(e)}")]
+            return [TextContent(type="text", text=f"Error getting bounding box: {_safe_exception_message(e)}")]
 
     elif name == "export_part_studio":
         try:
@@ -5363,8 +5375,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error exporting: API returned {e.response.status_code}.")]
         except Exception as e:
-            logger.exception("Unexpected error exporting Part Studio")
-            return [TextContent(type="text", text=f"Error exporting: {str(e)}")]
+            _log_unexpected_error("Unexpected error exporting Part Studio", e)
+            return [TextContent(type="text", text=f"Error exporting: {_safe_exception_message(e)}")]
 
     elif name == "export_assembly":
         try:
@@ -5385,8 +5397,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error exporting: API returned {e.response.status_code}.")]
         except Exception as e:
-            logger.exception("Unexpected error exporting Assembly")
-            return [TextContent(type="text", text=f"Error exporting: {str(e)}")]
+            _log_unexpected_error("Unexpected error exporting Assembly", e)
+            return [TextContent(type="text", text=f"Error exporting: {_safe_exception_message(e)}")]
 
     elif name == "check_assembly_interference":
         try:
@@ -5401,7 +5413,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error checking interference: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error checking interference: {str(e)}")]
+            return [TextContent(type="text", text=f"Error checking interference: {_safe_exception_message(e)}")]
 
     elif name == "get_assembly_positions":
         try:
@@ -5416,7 +5428,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error getting positions: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error getting positions: {str(e)}")]
+            return [TextContent(type="text", text=f"Error getting positions: {_safe_exception_message(e)}")]
 
     elif name == "set_instance_position":
         try:
@@ -5443,7 +5455,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("Unexpected error setting instance position")
+            _log_unexpected_error("Unexpected error setting instance position", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "align_instance_to_face":
@@ -5474,7 +5486,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except ValueError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
         except Exception as e:
-            logger.exception("Unexpected error aligning instance")
+            _log_unexpected_error("Unexpected error aligning instance", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "get_body_details":
@@ -5580,7 +5592,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error getting body details: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error getting body details: {str(e)}")]
+            return [TextContent(type="text", text=f"Error getting body details: {_safe_exception_message(e)}")]
 
     elif name == "get_assembly_features":
         try:
@@ -5626,7 +5638,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error getting assembly features: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error getting assembly features: {str(e)}")]
+            return [TextContent(type="text", text=f"Error getting assembly features: {_safe_exception_message(e)}")]
 
     elif name == "get_face_coordinate_system":
         try:
@@ -5655,11 +5667,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             )
             return [TextContent(type="text", text=text)]
         except RuntimeError as e:
-            return [TextContent(type="text", text=f"Error querying face CS: {str(e)}")]
+            return [TextContent(type="text", text=f"Error querying face CS: {_safe_exception_message(e)}")]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"Error querying face CS: API returned {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Error querying face CS: {str(e)}")]
+            return [TextContent(type="text", text=f"Error querying face CS: {_safe_exception_message(e)}")]
 
     # === Visual / Rendering Tools (added by dyna-fork) ===
     elif name in ("render_part_studio_views", "render_assembly_views"):
@@ -5702,22 +5714,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             return out
         except httpx.HTTPStatusError as e:
-            body = ""
-            try:
-                body = e.response.text[:400]
-            except Exception:
-                pass
             return [
                 TextContent(
                     type="text",
-                    text=(
-                        f"Render failed: HTTP {e.response.status_code} on /shadedviews. "
-                        f"Body: {body}"
-                    ),
+                    text=f"Render failed: {safe_http_diagnostic(e)}",
                 )
             ]
         except Exception as e:
-            return [TextContent(type="text", text=f"Render failed: {e}")]
+            return [TextContent(type="text", text=f"Render failed: {_safe_exception_message(e)}")]
 
     elif name == "extract_drawing_dimensions":
         try:
@@ -5742,10 +5746,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             return [TextContent(type="text", text="\n".join(summary_lines))]
         except FileNotFoundError as e:
-            return [TextContent(type="text", text=f"extract_drawing_dimensions: {e}")]
+            return [TextContent(type="text", text=f"extract_drawing_dimensions: {_safe_exception_message(e)}")]
         except Exception as e:
-            logger.exception("extract_drawing_dimensions failed")
-            return [TextContent(type="text", text=f"extract_drawing_dimensions failed: {e}")]
+            _log_unexpected_error("extract_drawing_dimensions failed", e)
+            return [TextContent(type="text", text=f"extract_drawing_dimensions failed: {_safe_exception_message(e)}")]
 
     elif name == "load_local_image":
         try:
@@ -5767,10 +5771,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 ),
             ]
         except FileNotFoundError as e:
-            return [TextContent(type="text", text=f"load_local_image: {e}")]
+            return [TextContent(type="text", text=f"load_local_image: {_safe_exception_message(e)}")]
         except Exception as e:
-            logger.exception("load_local_image failed")
-            return [TextContent(type="text", text=f"load_local_image failed: {e}")]
+            _log_unexpected_error("load_local_image failed", e)
+            return [TextContent(type="text", text=f"load_local_image failed: {_safe_exception_message(e)}")]
 
     elif name == "compare_to_reference":
         try:
@@ -5838,10 +5842,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 ),
             ]
         except FileNotFoundError as e:
-            return [TextContent(type="text", text=f"compare_to_reference: {e}")]
+            return [TextContent(type="text", text=f"compare_to_reference: {_safe_exception_message(e)}")]
         except Exception as e:
-            logger.exception("compare_to_reference failed")
-            return [TextContent(type="text", text=f"compare_to_reference failed: {e}")]
+            _log_unexpected_error("compare_to_reference failed", e)
+            return [TextContent(type="text", text=f"compare_to_reference failed: {_safe_exception_message(e)}")]
 
     elif name == "crop_image":
         try:
@@ -5877,9 +5881,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except ValueError as e:
-            return [TextContent(type="text", text=f"crop_image: {e}")]
+            return [TextContent(type="text", text=f"crop_image: {_safe_exception_message(e)}")]
         except Exception as e:
-            return [TextContent(type="text", text=f"crop_image failed: {e}")]
+            return [TextContent(type="text", text=f"crop_image failed: {_safe_exception_message(e)}")]
 
     elif name == "list_entities":
         try:
@@ -5907,7 +5911,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
         except Exception as e:
-            return [TextContent(type="text", text=f"list_entities failed: {e}")]
+            return [TextContent(type="text", text=f"list_entities failed: {_safe_exception_message(e)}")]
 
     elif name == "describe_part_studio":
         try:
@@ -5935,8 +5939,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"describe_part_studio failed: HTTP {e.response.status_code}.")]
         except Exception as e:
-            logger.exception("describe_part_studio failed")
-            return [TextContent(type="text", text=f"describe_part_studio failed: {e}")]
+            _log_unexpected_error("describe_part_studio failed", e)
+            return [TextContent(type="text", text=f"describe_part_studio failed: {_safe_exception_message(e)}")]
 
     elif name == "measure":
         try:
@@ -5951,7 +5955,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"measure failed: HTTP {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"measure failed: {e}")]
+            return [TextContent(type="text", text=f"measure failed: {_safe_exception_message(e)}")]
 
     elif name == "get_mass_properties":
         try:
@@ -5972,7 +5976,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=f"get_mass_properties failed: HTTP {e.response.status_code}.")]
         except Exception as e:
-            return [TextContent(type="text", text=f"get_mass_properties failed: {e}")]
+            return [TextContent(type="text", text=f"get_mass_properties failed: {_safe_exception_message(e)}")]
 
     elif name == "list_cached_images":
         entries = list_cached_image_ids()
@@ -6018,7 +6022,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
-            logger.exception("write_featurescript_feature failed")
+            _log_unexpected_error("write_featurescript_feature failed", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     else:
