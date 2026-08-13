@@ -18,6 +18,7 @@ from onshape_mcp.governance import (
 
 
 MAX_INLINE_BYTES = 32_768
+MAX_NORMALIZED_PARAMETER_BYTES = 4_096
 SANITIZED_FEATURE_ROUTE = (
     "/api/v9/partstudios/d/{documentId}/w/{workspaceId}/e/{elementId}/features"
 )
@@ -45,6 +46,78 @@ def _contains_forbidden_raw_data(value: Any) -> bool:
         return any(_contains_forbidden_raw_data(item) for item in value.values())
     if isinstance(value, list):
         return any(_contains_forbidden_raw_data(item) for item in value)
+    return False
+
+
+def _select_parameterized_ok_feature(rows: list[Any]) -> dict[str, Any] | None:
+    """Choose an inspectable OK feature without exposing a row in failures."""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parameter_count = row.get("parameterCount")
+        feature_id = row.get("featureId")
+        if (
+            row.get("status") == "OK"
+            and isinstance(feature_id, str)
+            and bool(feature_id)
+            and isinstance(parameter_count, int)
+            and not isinstance(parameter_count, bool)
+            and parameter_count > 0
+        ):
+            return row
+    return None
+
+
+def _has_useful_summary(parameter: dict[str, Any]) -> bool:
+    for key in ("value_summary", "reference_summary"):
+        if key not in parameter:
+            continue
+        summary = parameter[key]
+        useful = bool(summary) if isinstance(summary, (str, list, dict)) else summary is not None
+        if not useful:
+            continue
+        try:
+            encoded = json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        except (TypeError, ValueError):
+            continue
+        if len(encoded) <= MAX_NORMALIZED_PARAMETER_BYTES:
+            return True
+    return False
+
+
+def _has_useful_normalized_parameters(feature: dict[str, Any]) -> bool:
+    """Validate the bounded normalized projection, never the raw feature payload."""
+    parameters = feature.get("parameters")
+    parameter_count = feature.get("parameter_count")
+    returned = feature.get("returned_parameters")
+    if (
+        not isinstance(parameters, list)
+        or not parameters
+        or not isinstance(parameter_count, int)
+        or isinstance(parameter_count, bool)
+        or not isinstance(returned, int)
+        or isinstance(returned, bool)
+        or returned != len(parameters)
+        or returned <= 0
+        or returned > parameter_count
+    ):
+        return False
+
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        parameter_id = parameter.get("parameterId")
+        parameter_type = parameter.get("parameterType")
+        if (
+            isinstance(parameter_id, str)
+            and 0 < len(parameter_id) <= 128
+            and isinstance(parameter_type, str)
+            and 0 < len(parameter_type) <= 128
+            and _has_useful_summary(parameter)
+        ):
+            return True
     return False
 
 
@@ -126,9 +199,9 @@ async def test_live_deep_read_01(
         search_rows = found.get("data", {}).get("rows")
         if not isinstance(search_rows, list) or not search_rows:
             pytest.fail("LIVE_SEARCH_EMPTY")
-        selected = search_rows[0]
-        if not isinstance(selected, dict) or selected.get("status") != "OK":
-            pytest.fail("LIVE_OK_FEATURE_NOT_FOUND")
+        selected = _select_parameterized_ok_feature(search_rows)
+        if selected is None:
+            pytest.fail("LIVE_PARAMETERIZED_OK_FEATURE_NOT_FOUND")
         feature_id = selected.get("featureId")
         if not isinstance(feature_id, str) or not feature_id:
             pytest.fail("LIVE_FEATURE_ID_MISSING")
@@ -151,6 +224,8 @@ async def test_live_deep_read_01(
             pytest.fail("LIVE_INSPECTION_EMPTY")
         if inspected_feature.get("status") != "OK":
             pytest.fail("LIVE_INSPECTION_STATUS_NOT_OK")
+        if not _has_useful_normalized_parameters(inspected_feature):
+            pytest.fail("LIVE_NORMALIZED_PARAMETERS_INVALID")
         dependency_slice = _decode(
             await server.call_tool(
                 "get_dependency_slice",
