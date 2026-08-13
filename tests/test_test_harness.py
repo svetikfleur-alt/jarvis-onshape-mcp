@@ -22,8 +22,10 @@ from tests.conftest import (
     pytest_collection_modifyitems,
     pytest_terminal_summary,
 )
+from tests.support.live_config import load_live_config
 from tests.support.network_guard import (
     NETWORK_ACCESS_FORBIDDEN_IN_TEST,
+    _SOCKET_SEND_METHODS,
     _permit_guarded_network,
 )
 
@@ -678,7 +680,11 @@ def test_dns_policy(forbidden_dns):
 
 
 @pytest.mark.asyncio
-async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidden() -> None:
+async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_readonly_live(monkeypatch)
+    live_config = load_live_config()
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -702,8 +708,8 @@ async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidde
         httpx.AsyncHTTPTransport(retries=0), guard, _permit_guarded_network
     )
     credentials = OnshapeCredentials(
-        access_key="access-canary",
-        secret_key="secret-canary",
+        access_key=live_config.access_key,
+        secret_key=live_config.secret_key,
         base_url=f"http://127.0.0.1:{port}",
     )
     try:
@@ -722,10 +728,22 @@ async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidde
         with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
             socket.getnameinfo(("127.0.0.1", port), 0)
         with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+                datagram.sendto(b"forbidden", ("127.0.0.1", port))
+        if hasattr(socket.socket, "sendmsg"):
+            with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+                    datagram.sendmsg([b"forbidden"], [], 0, ("127.0.0.1", port))
+        with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
             await asyncio.get_running_loop().getaddrinfo("localhost", port)
     finally:
         server.close()
         thread.join(timeout=2)
+
+
+def test_network_guard_declares_every_public_datagram_send_boundary() -> None:
+    assert "sendto" in _SOCKET_SEND_METHODS
+    assert "sendmsg" in _SOCKET_SEND_METHODS
 
 
 @pytest.mark.asyncio

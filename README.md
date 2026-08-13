@@ -266,8 +266,12 @@ function Invoke-LocalLive {
     $env:ONSHAPE_ACCESS_KEY = $AccessKey; $env:ONSHAPE_SECRET_KEY = $SecretKey
     $env:JARVIS_LIVE_DOCUMENT_ID = $DocumentId; $env:JARVIS_LIVE_WORKSPACE_ID = $WorkspaceId
     $env:JARVIS_LIVE_ELEMENT_ID = $ElementId
+    $apiPresent = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_KEY) -or -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_SECRET)
+    $accessPresent = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_ACCESS_KEY) -or -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_SECRET_KEY)
     $apiComplete = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_KEY) -and -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_API_SECRET)
     $accessComplete = -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_ACCESS_KEY) -and -not [string]::IsNullOrWhiteSpace($env:ONSHAPE_SECRET_KEY)
+    if ($apiPresent -and -not $apiComplete) { throw 'The API credential pair is incomplete' }
+    if ($accessPresent -and -not $accessComplete) { throw 'The access credential pair is incomplete' }
     if ([int]$apiComplete + [int]$accessComplete -ne 1) { throw 'Configure exactly one complete credential pair' }
     foreach ($name in @('JARVIS_LIVE_DOCUMENT_ID','JARVIS_LIVE_WORKSPACE_ID','JARVIS_LIVE_ELEMENT_ID')) {
       if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name").Value)) { throw 'Missing required live sandbox ID' }

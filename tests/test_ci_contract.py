@@ -114,3 +114,13 @@ def test_readmes_document_guarded_local_live_contract_without_private_values() -
         assert "$LASTEXITCODE" in text
         assert "exit $exitCode" in text
         assert "finally" in lowered
+        assert "$apiPresent" in text
+        assert "$accessPresent" in text
+        assert "$apiPresent -and -not $apiComplete" in text
+        assert "$accessPresent -and -not $accessComplete" in text
+        assert text.index("$apiPresent -and -not $apiComplete") < text.index(
+            "$env:JARVIS_LIVE_TESTS = '1'"
+        )
+        assert text.index("$accessPresent -and -not $accessComplete") < text.index(
+            "$env:JARVIS_LIVE_TESTS = '1'"
+        )

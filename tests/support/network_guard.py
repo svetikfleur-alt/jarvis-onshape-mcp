@@ -9,6 +9,7 @@ import socket
 NETWORK_ACCESS_FORBIDDEN_IN_TEST = "NETWORK_ACCESS_FORBIDDEN_IN_TEST"
 _CAPABILITY = object()
 _network_capability: ContextVar[object | None] = ContextVar("guarded_network", default=None)
+_SOCKET_SEND_METHODS = ("connect", "connect_ex", "sendto", "sendmsg")
 
 
 def _require_permit(*args: object, **kwargs: object) -> None:
@@ -39,16 +40,21 @@ def install_network_guard(monkeypatch) -> None:
         with _permit_guarded_network():
             return original_socketpair(*args, **kwargs)
 
-    for owner, name in (
-        (socket.socket, "connect"),
-        (socket.socket, "connect_ex"),
-        (socket.socket, "sendto"),
+    guarded_boundaries = [
+        (socket.socket, name)
+        for name in _SOCKET_SEND_METHODS
+        if hasattr(socket.socket, name)
+    ]
+    guarded_boundaries.extend(
+        (
         (socket, "getaddrinfo"),
         (socket, "gethostbyname"),
         (socket, "gethostbyname_ex"),
         (socket, "gethostbyaddr"),
         (socket, "getnameinfo"),
-    ):
+        )
+    )
+    for owner, name in guarded_boundaries:
         monkeypatch.setattr(owner, name, guarded(getattr(owner, name)))
     monkeypatch.setattr(socket, "socketpair", local_socketpair)
     for name in ("getaddrinfo", "getnameinfo"):
