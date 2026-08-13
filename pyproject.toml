@@ -69,7 +69,13 @@ addopts = [
 markers = [
     "asyncio: marks tests as async",
     "unit: marks tests as unit tests",
+    "contract: marks tests as boundary contract tests",
+    "mcp: marks tests that exercise the MCP boundary",
     "integration: marks tests as integration tests",
+    "live_onshape: marks explicitly selected live Onshape tests",
+    "live_readonly: marks read-only live Onshape tests",
+    "live_mutation: marks mutating live Onshape tests",
+    "live_budget(limit): lowers the physical-send budget for a live test",
     "slow: marks tests as slow running",
 ]
 
