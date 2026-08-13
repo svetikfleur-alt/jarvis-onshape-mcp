@@ -3,10 +3,12 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
 
 import httpx
 import pytest
 
+import onshape_mcp.api.request_guard as request_guard
 from onshape_mcp.api.request_guard import (
     BudgetedAsyncTransport,
     LiveApiBudgetExceeded,
@@ -70,12 +72,70 @@ def test_sanitize_request_names_onshape_ids_and_discards_query_and_fragment():
     )
 
     assert descriptor.method == "GET"
+    assert descriptor.host == "cad.onshape.com"
     assert (
         descriptor.path
-        == "/api/v9/documents/d/{documentId}/w/{workspaceId}/e/{elementId}/features/{opaque}"
+        == "/api/v9/documents/d/{documentId}/w/{workspaceId}/e/{elementId}/features/{featureId}"
     )
     assert "private" not in str(descriptor)
     assert "canary" not in str(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_route"),
+    [
+        (
+            "/api/v9/partstudios/d/doc-canary/w/workspace-canary/e/element-canary/"
+            "features/v123",
+            "/api/v9/partstudios/d/{documentId}/w/{workspaceId}/e/{elementId}/"
+            "features/{featureId}",
+        ),
+        (
+            "/api/v9/partstudios/d/doc-canary/w/workspace-canary/e/element-canary/"
+            "features/metadata",
+            "/api/v9/partstudios/d/{documentId}/w/{workspaceId}/e/{elementId}/"
+            "features/{featureId}",
+        ),
+        (
+            "/api/v9/partstudios/d/doc-canary/w/workspace-canary/e/element-canary/"
+            "features/featureid/metadata",
+            "/api/v9/partstudios/d/{documentId}/w/{workspaceId}/e/{elementId}/"
+            "features/featureid/{featureId}",
+        ),
+        (
+            "/api/v9/parts/d/doc-canary/w/workspace-canary/e/element-canary/"
+            "partid/v123/massproperties",
+            "/api/v9/parts/d/{documentId}/w/{workspaceId}/e/{elementId}/"
+            "partid/{partId}/massproperties",
+        ),
+        (
+            "/api/v6/translations/metadata",
+            "/api/v6/translations/{translationId}",
+        ),
+        (
+            "/api/v6/documents/d/doc-canary/externaldata/v123",
+            "/api/v6/documents/d/{documentId}/externaldata/{externalDataId}",
+        ),
+    ],
+)
+def test_sanitize_request_redacts_identifier_slots_regardless_of_static_spelling(
+    path, expected_route
+):
+    descriptor = sanitize_request("GET", httpx.URL(f"https://cad.onshape.com{path}"))
+
+    assert descriptor.path == expected_route
+    assert "doc-canary" not in repr(descriptor)
+    assert "workspace-canary" not in repr(descriptor)
+    assert "element-canary" not in repr(descriptor)
+
+
+def test_sanitize_request_recognizes_version_syntax_only_in_api_version_position():
+    descriptor = sanitize_request(
+        "GET",
+        httpx.URL("https://cad.onshape.com/api/v123/translations/v456"),
+    )
+
+    assert descriptor.path == "/api/v123/translations/{translationId}"
 
 
 def test_sanitize_request_redacts_unrecognised_path_values():
@@ -114,6 +174,132 @@ def test_budget_exception_omits_private_test_identifier_from_text_and_fields():
 
     assert "private-test-name-canary" not in str(caught.value)
     assert caught.value.test_name is None
+
+
+def test_successful_reservation_emits_one_immutable_structured_event():
+    events = []
+    suite = LiveSuiteBudget(limit=30)
+    guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 3, suite, event_sink=events)
+    descriptor = sanitize_request(
+        "get",
+        httpx.URL(
+            "https://cad.onshape.com/api/v9/documents/d/private-document-id"
+            "?token=private-query-canary#private-fragment-canary"
+        ),
+    )
+
+    guard.reserve(descriptor)
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, request_guard.LiveRequestEvent)
+    assert event.test_identifier == "LIVE-DEEP-READ-01"
+    assert event.method == "GET"
+    assert event.host == "cad.onshape.com"
+    assert event.route == "/api/v9/documents/d/{documentId}"
+    assert event.test_used == 1
+    assert event.test_limit == 3
+    assert event.suite_used == 1
+    assert event.suite_limit == 30
+    assert event.blocked_scope == "none"
+    with pytest.raises(FrozenInstanceError):
+        event.method = "POST"
+
+
+def test_overflow_events_report_test_suite_and_combined_blocking_scopes():
+    test_events = []
+    test_suite = LiveSuiteBudget(limit=10)
+    test_guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 1, test_suite, event_sink=test_events)
+    test_guard.reserve()
+    with pytest.raises(LiveApiBudgetExceeded):
+        test_guard.reserve()
+
+    suite_events = []
+    suite_budget = LiveSuiteBudget(limit=1)
+    LiveBudgetGuard("LIVE-DEEP-READ-01", 3, suite_budget).reserve()
+    suite_guard = LiveBudgetGuard(
+        "LIVE-DEEP-READ-02", 3, suite_budget, event_sink=suite_events
+    )
+    with pytest.raises(LiveApiBudgetExceeded):
+        suite_guard.reserve()
+
+    both_events = []
+    both_suite = LiveSuiteBudget(limit=1)
+    both_guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 1, both_suite, event_sink=both_events)
+    both_guard.reserve()
+    with pytest.raises(LiveApiBudgetExceeded):
+        both_guard.reserve()
+
+    assert test_events[-1].blocked_scope == "test"
+    assert len(test_events) == 2
+    assert (test_events[-1].test_used, test_events[-1].suite_used) == (1, 1)
+    assert suite_events[-1].blocked_scope == "suite"
+    assert len(suite_events) == 1
+    assert (suite_events[-1].test_used, suite_events[-1].suite_used) == (0, 1)
+    assert both_events[-1].blocked_scope == "test_and_suite"
+    assert len(both_events) == 2
+    assert (both_events[-1].test_used, both_events[-1].suite_used) == (1, 1)
+
+
+def test_concurrent_reservations_emit_one_atomically_counted_event_per_attempt():
+    events = []
+    suite = LiveSuiteBudget(limit=5)
+    guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 5, suite, event_sink=events)
+    descriptor = sanitize_request(
+        "GET", httpx.URL("https://cad.onshape.com/api/v9/documents/d/private-id")
+    )
+
+    def reserve_once() -> None:
+        try:
+            guard.reserve(descriptor)
+        except LiveApiBudgetExceeded:
+            pass
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(executor.map(lambda _: reserve_once(), range(16)))
+
+    assert len(events) == 16
+    assert [event.test_used for event in events[:5]] == [1, 2, 3, 4, 5]
+    assert [event.blocked_scope for event in events[:5]] == ["none"] * 5
+    assert [event.blocked_scope for event in events[5:]] == ["test_and_suite"] * 11
+    assert all(event.test_used == 5 and event.suite_used == 5 for event in events[5:])
+
+
+def test_event_fields_and_repr_contain_no_poison_canaries_or_request_objects():
+    events = []
+    suite = LiveSuiteBudget(limit=1)
+    guard = LiveBudgetGuard(
+        "tests/live/test_private.py::test_case[private-test-name-canary]",
+        1,
+        suite,
+        event_sink=events,
+    )
+    descriptor = sanitize_request(
+        "POST",
+        httpx.URL(
+            "https://access-key-canary:secret-key-canary@cad.onshape.com/"
+            "api/v9/documents/d/private-document-canary/features/metadata"
+            "?token=private-query-canary#private-fragment-canary"
+        ),
+    )
+
+    guard.reserve(descriptor)
+
+    event = events[0]
+    event_text = repr(event)
+    for poison in (
+        "private-test-name-canary",
+        "access-key-canary",
+        "secret-key-canary",
+        "private-document-canary",
+        "private-query-canary",
+        "private-fragment-canary",
+    ):
+        assert poison not in event_text
+        assert all(poison not in str(value) for value in vars(event).values())
+    assert guard.test_name == "LIVE-SCENARIO"
+    assert event.test_identifier == "LIVE-SCENARIO"
+    assert not any(isinstance(value, (httpx.Request, httpx.Response)) for value in vars(event).values())
 
 
 def test_suite_budget_overflow_does_not_consume_a_physical_send():
@@ -215,7 +401,8 @@ async def test_redirect_overflow_blocks_before_second_inner_invocation():
 @pytest.mark.asyncio
 async def test_failed_inner_transport_consumes_one_reservation():
     suite = LiveSuiteBudget(limit=2)
-    guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 2, suite)
+    events = []
+    guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 2, suite, event_sink=events)
     inner = FailingTransport()
 
     async with httpx.AsyncClient(transport=BudgetedAsyncTransport(inner, guard)) as client:
@@ -225,6 +412,9 @@ async def test_failed_inner_transport_consumes_one_reservation():
     assert inner.calls == 1
     assert guard.used == 1
     assert suite.used == 1
+    assert len(events) == 1
+    assert events[0].blocked_scope == "none"
+    assert (events[0].test_used, events[0].suite_used) == (1, 1)
 
 
 @pytest.mark.asyncio

@@ -1,41 +1,83 @@
 """Safe accounting for live HTTP requests at the supported HTTPX boundary."""
 
+import re
+from collections.abc import Callable, MutableSequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from threading import Lock
-from typing import Callable, ContextManager, Optional
+from typing import ContextManager, Literal, Optional
 
 import httpx
 
 
-_SAFE_PATH_SEGMENTS = frozenset(
+_ROOT_RESOURCES = frozenset(
     {
-        "api",
         "assemblies",
+        "documents",
+        "externaldata",
+        "features",
+        "parts",
+        "partstudios",
+        "translations",
+    }
+)
+_STATIC_ROUTE_SEGMENTS = frozenset(
+    {
+        "bodydetails",
         "bom",
         "configuration",
         "current",
-        "documents",
         "elements",
         "export",
-        "externaldata",
-        "features",
+        "featurescript",
+        "massproperties",
         "metadata",
-        "partstudios",
+        "shadedviews",
         "tabs",
         "thumbnails",
-        "translations",
         "variables",
         "versions",
         "workspaces",
     }
 )
-_NAMED_IDENTIFIERS = {
+_IDENTIFIER_MARKERS = {
     "d": "documentId",
     "e": "elementId",
+    "featureid": "featureId",
     "m": "microversionId",
+    "partid": "partId",
     "w": "workspaceId",
 }
+_COLLECTION_IDENTIFIERS = {
+    "documents": "documentId",
+    "externaldata": "externalDataId",
+    "features": "featureId",
+    "parts": "partId",
+    "translations": "translationId",
+}
+_SAFE_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
+_SAFE_SCENARIO = re.compile(r"LIVE-[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-\d{2}")
+_GENERIC_SCENARIO = "LIVE-SCENARIO"
+
+
+def _identifier_after_collection(
+    collection: str, next_segment: Optional[str]
+) -> Optional[str]:
+    """Name an identifier only when the route position is unambiguous."""
+    if next_segment is None:
+        return None
+    if collection in {"documents", "parts"} and next_segment in _IDENTIFIER_MARKERS:
+        return None
+    if collection == "features" and next_segment == "featureid":
+        return None
+    return _COLLECTION_IDENTIFIERS[collection]
+
+
+def _sanitize_test_identifier(test_name: str) -> str:
+    """Keep only explicit, bounded live scenario identifiers."""
+    if _SAFE_SCENARIO.fullmatch(test_name):
+        return test_name
+    return _GENERIC_SCENARIO
 
 
 @dataclass(frozen=True)
@@ -44,6 +86,33 @@ class RequestDescriptor:
 
     method: str
     path: str
+    host: str = "{unknown}"
+
+    @property
+    def route(self) -> str:
+        """Alias the sanitized path using telemetry terminology."""
+        return self.path
+
+
+BlockedScope = Literal["none", "test", "suite", "test_and_suite"]
+
+
+@dataclass(frozen=True)
+class LiveRequestEvent:
+    """Immutable diagnostic-safe telemetry for one reservation attempt."""
+
+    test_identifier: str
+    method: str
+    host: str
+    route: str
+    test_used: int
+    test_limit: int
+    suite_used: int
+    suite_limit: int
+    blocked_scope: BlockedScope
+
+
+EventSink = Callable[[LiveRequestEvent], None] | MutableSequence[LiveRequestEvent]
 
 
 def sanitize_request(method: str, url: httpx.URL) -> RequestDescriptor:
@@ -51,18 +120,38 @@ def sanitize_request(method: str, url: httpx.URL) -> RequestDescriptor:
     parts = [part for part in url.path.split("/") if part]
     sanitized: list[str] = []
     identifier_name: Optional[str] = None
+    known_route = False
 
     for index, part in enumerate(parts):
         if identifier_name is not None:
             sanitized.append(f"{{{identifier_name}}}")
             identifier_name = None
-        elif part in _NAMED_IDENTIFIERS:
+        elif index == 0:
+            sanitized.append("api" if part == "api" else "{opaque}")
+        elif index == 1:
+            is_version = parts[0] == "api" and re.fullmatch(r"v\d+", part) is not None
+            sanitized.append(part if is_version else "{opaque}")
+        elif index == 2:
+            if parts[0] == "api" and part in _ROOT_RESOURCES:
+                sanitized.append(part)
+                known_route = True
+                if part in _COLLECTION_IDENTIFIERS:
+                    identifier_name = _identifier_after_collection(
+                        part, parts[index + 1] if index + 1 < len(parts) else None
+                    )
+            else:
+                sanitized.append("{opaque}")
+        elif not known_route:
+            sanitized.append("{opaque}")
+        elif part in _IDENTIFIER_MARKERS:
             sanitized.append(part)
-            identifier_name = _NAMED_IDENTIFIERS[part]
-        elif part == "documents" and (index + 1 == len(parts) or parts[index + 1] != "d"):
+            identifier_name = _IDENTIFIER_MARKERS[part]
+        elif part in _COLLECTION_IDENTIFIERS:
             sanitized.append(part)
-            identifier_name = "documentId"
-        elif part in _SAFE_PATH_SEGMENTS or (part.startswith("v") and part[1:].isdigit()):
+            identifier_name = _identifier_after_collection(
+                part, parts[index + 1] if index + 1 < len(parts) else None
+            )
+        elif part in _STATIC_ROUTE_SEGMENTS:
             sanitized.append(part)
         else:
             sanitized.append("{opaque}")
@@ -70,7 +159,14 @@ def sanitize_request(method: str, url: httpx.URL) -> RequestDescriptor:
     if identifier_name is not None:
         sanitized.append(f"{{{identifier_name}}}")
 
-    return RequestDescriptor(method=method.upper(), path="/" + "/".join(sanitized))
+    normalized_method = method.upper()
+    if normalized_method not in _SAFE_METHODS:
+        normalized_method = "UNKNOWN"
+    return RequestDescriptor(
+        method=normalized_method,
+        host=url.host or "{unknown}",
+        path="/" + "/".join(sanitized),
+    )
 
 
 class LiveApiBudgetExceeded(RuntimeError):
@@ -114,23 +210,61 @@ class LiveSuiteBudget:
 class LiveBudgetGuard:
     """Per-test budget coordinated atomically with a shared suite budget."""
 
-    def __init__(self, test_name: str, test_limit: int, suite_budget: LiveSuiteBudget) -> None:
+    def __init__(
+        self,
+        test_name: str,
+        test_limit: int,
+        suite_budget: LiveSuiteBudget,
+        event_sink: Optional[EventSink] = None,
+    ) -> None:
         if test_limit < 0:
             raise ValueError("Live test budget limit must be non-negative")
-        self.test_name = test_name
+        self.test_name = _sanitize_test_identifier(test_name)
         self.test_limit = test_limit
         self.suite_budget = suite_budget
+        self._event_sink = event_sink
         self.used = 0
         self.blocked = 0
+
+    def _emit_event(
+        self, descriptor: RequestDescriptor, blocked_scope: BlockedScope
+    ) -> None:
+        sink = self._event_sink
+        if sink is None:
+            return
+        event = LiveRequestEvent(
+            test_identifier=self.test_name,
+            method=descriptor.method,
+            host=descriptor.host,
+            route=descriptor.route,
+            test_used=self.used,
+            test_limit=self.test_limit,
+            suite_used=self.suite_budget.used,
+            suite_limit=self.suite_budget.limit,
+            blocked_scope=blocked_scope,
+        )
+        if callable(sink):
+            sink(event)
+        else:
+            sink.append(event)
 
     def reserve(self, descriptor: Optional[RequestDescriptor] = None) -> None:
         """Atomically reserve one physical send or fail before it reaches HTTPX."""
         request = descriptor or RequestDescriptor(method="UNKNOWN", path="/{opaque}")
         suite = self.suite_budget
         with suite._lock:
-            if self.used >= self.test_limit or suite.used >= suite.limit:
+            test_blocked = self.used >= self.test_limit
+            suite_blocked = suite.used >= suite.limit
+            if test_blocked or suite_blocked:
                 self.blocked += 1
                 suite.blocked += 1
+                if test_blocked and suite_blocked:
+                    blocked_scope: BlockedScope = "test_and_suite"
+                elif test_blocked:
+                    blocked_scope = "test"
+                else:
+                    blocked_scope = "suite"
+                self._emit_event(request, blocked_scope)
                 raise LiveApiBudgetExceeded(
                     request,
                     self.used,
@@ -140,6 +274,7 @@ class LiveBudgetGuard:
                 )
             self.used += 1
             suite.used += 1
+            self._emit_event(request, "none")
 
 
 class BudgetedAsyncTransport(httpx.AsyncBaseTransport):
