@@ -301,6 +301,56 @@ def test_offline_policy():
     result.assert_outcomes(passed=1, deselected=1)
 
 
+def test_mixed_expression_with_only_negated_live_term_stays_offline(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_subprocess(pytester, monkeypatch)
+    _enable_readonly_live(monkeypatch)
+    pytester.makepyfile(
+        """
+import pytest
+
+@pytest.mark.live_onshape
+@pytest.mark.live_readonly
+def test_live_policy():
+    raise AssertionError("negated live test ran")
+
+@pytest.mark.unit
+def test_offline_policy():
+    pass
+"""
+    )
+
+    result = pytester.runpytest_subprocess("-q", "-m", "unit and not live_onshape")
+
+    result.assert_outcomes(passed=1, deselected=1)
+
+
+def test_shadow_disjunction_does_not_supply_positive_live_selection(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_subprocess(pytester, monkeypatch)
+    _enable_readonly_live(monkeypatch)
+    pytester.makepyfile(
+        """
+import pytest
+
+@pytest.mark.live_onshape
+@pytest.mark.live_readonly
+@pytest.mark.live_onshape_shadow
+def test_live_policy():
+    raise AssertionError("live setup reached")
+"""
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "-m", "not live_onshape or live_onshape_shadow"
+    )
+
+    assert result.ret != 0
+    result.stderr.fnmatch_lines(["*LIVE_POSITIVE_SELECTION_REQUIRED*"])
+
+
 def test_live_budget_marker_can_lower_readonly_default(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -518,3 +568,25 @@ async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidde
     finally:
         server.close()
         thread.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_running_event_loop_sock_connect_is_guarded() -> None:
+    direct_socket = socket.socket()
+    direct_socket.setblocking(False)
+    try:
+        with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+            await asyncio.get_running_loop().sock_connect(direct_socket, ("127.0.0.1", 9))
+    finally:
+        direct_socket.close()
+
+
+@pytest.mark.asyncio
+async def test_importable_base_proactor_sock_connect_override_is_guarded() -> None:
+    try:
+        from asyncio.proactor_events import BaseProactorEventLoop
+    except ImportError:
+        pytest.skip("proactor event loops are unavailable on this platform")
+
+    with pytest.raises(RuntimeError, match=NETWORK_ACCESS_FORBIDDEN_IN_TEST):
+        await BaseProactorEventLoop.sock_connect(None, None, None)

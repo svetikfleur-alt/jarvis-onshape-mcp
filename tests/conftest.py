@@ -55,14 +55,35 @@ def _has_positive_live_selection(markexpr):
     return expression is not None and contains(expression)
 
 
-def _is_pure_live_negation(markexpr):
+def _can_select_live_item(markexpr):
     expression = _parse_marker_expression(markexpr)
-    return (
-        isinstance(expression, ast.UnaryOp)
-        and isinstance(expression.op, ast.Not)
-        and isinstance(expression.operand, ast.Name)
-        and expression.operand.id == "live_onshape"
-    )
+    if expression is None:
+        return True
+
+    def possible_values(node):
+        if isinstance(node, ast.Name):
+            return {True} if node.id == "live_onshape" else {False, True}
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return {not value for value in possible_values(node.operand)}
+        if isinstance(node, ast.BoolOp):
+            child_values = [possible_values(value) for value in node.values]
+            if isinstance(node.op, ast.And):
+                values = set()
+                if all(True in child for child in child_values):
+                    values.add(True)
+                if any(False in child for child in child_values):
+                    values.add(False)
+                return values
+            if isinstance(node.op, ast.Or):
+                values = set()
+                if any(True in child for child in child_values):
+                    values.add(True)
+                if all(False in child for child in child_values):
+                    values.add(False)
+                return values
+        return {True}
+
+    return True in possible_values(expression)
 
 
 def _fail(code):
@@ -91,7 +112,7 @@ def pytest_collection_modifyitems(config, items):
         for item in live_items:
             item.add_marker(pytest.mark.skip(reason="live tests require JARVIS_LIVE_TESTS=1"))
         return
-    if _is_pure_live_negation(markexpr):
+    if not positive_live and not _can_select_live_item(markexpr):
         return
     if not positive_live:
         _fail("LIVE_POSITIVE_SELECTION_REQUIRED")

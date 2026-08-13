@@ -56,10 +56,37 @@ def install_network_guard(monkeypatch) -> None:
             monkeypatch.setattr(
                 asyncio.BaseEventLoop, name, guarded(getattr(asyncio.BaseEventLoop, name))
             )
-    loop_classes = {
-        asyncio.BaseEventLoop,
-        getattr(asyncio, "ProactorEventLoop", asyncio.BaseEventLoop),
-        getattr(asyncio, "SelectorEventLoop", asyncio.BaseEventLoop),
-    }
+    loop_classes = [asyncio.BaseEventLoop]
+    try:
+        from asyncio.selector_events import BaseSelectorEventLoop
+
+        loop_classes.append(BaseSelectorEventLoop)
+    except ImportError:
+        pass
+    try:
+        from asyncio.proactor_events import BaseProactorEventLoop
+
+        loop_classes.append(BaseProactorEventLoop)
+    except ImportError:
+        pass
+    try:
+        from asyncio.windows_events import ProactorEventLoop
+
+        loop_classes.append(ProactorEventLoop)
+    except ImportError:
+        pass
+    loop_classes.extend(
+        loop_class
+        for name in ("SelectorEventLoop", "ProactorEventLoop")
+        if (loop_class := getattr(asyncio, name, None)) is not None
+    )
+
+    seen_classes: set[type] = set()
+    seen_methods: set[int] = set()
     for loop_class in loop_classes:
-        monkeypatch.setattr(loop_class, "sock_connect", guarded(loop_class.sock_connect))
+        original = getattr(loop_class, "sock_connect", None)
+        if loop_class in seen_classes or original is None or id(original) in seen_methods:
+            continue
+        seen_classes.add(loop_class)
+        seen_methods.add(id(original))
+        monkeypatch.setattr(loop_class, "sock_connect", guarded(original))
