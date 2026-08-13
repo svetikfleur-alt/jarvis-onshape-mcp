@@ -50,6 +50,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 from .export import ExportManager, TranslationResult
 
@@ -164,7 +166,7 @@ class DrawingSectionManager:
         try:
             await self.client.delete(path)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"delete_drawing({drawing_element_id}) failed: {e}")
+            logger.warning("delete_drawing failed: {}", safe_exception_message(e))
 
     # ---- Modify + poll ---------------------------------------------------
 

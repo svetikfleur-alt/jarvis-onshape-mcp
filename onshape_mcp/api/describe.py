@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 from .entities import EntityManager
 from .featurescript import FeatureScriptManager
@@ -377,7 +379,7 @@ class DescribeManager:
 
         def _safe(val, label):
             if isinstance(val, Exception):
-                logger.warning(f"describe: {label} failed: {val}")
+                logger.warning("describe: {} failed: {}", label, safe_exception_message(val))
                 return None
             return val
 
@@ -417,7 +419,10 @@ class DescribeManager:
         try:
             return await self.measurements.mass_properties_part_studio(did, wid, eid)
         except Exception as e:
-            logger.warning(f"mass_properties failed (likely empty PS): {e}")
+            logger.warning(
+                "mass_properties failed (likely empty PS): {}",
+                safe_exception_message(e),
+            )
             return {}
 
     async def _fetch_face_areas(self, did: str, wid: str, eid: str) -> Dict[str, float]:
@@ -429,7 +434,7 @@ class DescribeManager:
         try:
             resp = await self.featurescript.evaluate(did, wid, eid, _FACE_AREAS_FS)
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"face-area FS probe failed: {e}")
+            logger.debug("face-area FS probe failed: {}", safe_exception_message(e))
             return {}
         return _parse_fs_area_map(resp)
 

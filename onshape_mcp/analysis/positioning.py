@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Tuple, Union
 
 from loguru import logger
 
+from ..api.request_guard import safe_exception_message
+
 from .interference import BoundingBox, get_world_aabb
 from ..builders._units import parse_length
 
@@ -237,7 +239,7 @@ async def get_assembly_positions(
                 )
                 bbox_cache[cache_key] = BoundingBox.from_api_response(bbox_data)
             except Exception as e:
-                logger.warning(f"Could not get bbox for part {inst_part_id}: {e}")
+                logger.warning("Could not get bbox for part: {}", safe_exception_message(e))
 
     # Build position info for each instance
     positions: List[InstancePositionInfo] = []

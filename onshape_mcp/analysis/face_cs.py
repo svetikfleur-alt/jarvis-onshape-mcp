@@ -5,6 +5,8 @@ from typing import Any, Dict, Tuple
 
 from loguru import logger
 
+from ..api.request_guard import safe_exception_message
+
 
 METERS_TO_INCHES = 1.0 / 0.0254
 
@@ -151,7 +153,7 @@ async def query_face_coordinate_system(
         cs = extract_mc_coordinate_system(assembly_data, mc_feature_id)
         if cs is None:
             raise RuntimeError(
-                f"Could not find resolved coordinate system for MC {mc_feature_id}. "
+                "Could not find resolved coordinate system for the temporary MC. "
                 "The assembly definition may not include mate feature data in the expected format."
             )
 
@@ -163,6 +165,7 @@ async def query_face_coordinate_system(
             )
         except Exception as e:
             logger.warning(
-                f"Failed to delete temporary MC {mc_feature_id}: {e}. "
-                "You may need to manually delete '__temp_cs_query__' from the assembly."
+                "Failed to delete temporary MC: {}. You may need to manually delete "
+                "'__temp_cs_query__' from the assembly.",
+                safe_exception_message(e),
             )

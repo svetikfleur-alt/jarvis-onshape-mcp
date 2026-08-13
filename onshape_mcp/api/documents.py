@@ -112,7 +112,10 @@ class DocumentManager:
                 # Skip documents with invalid data - but log for debugging
                 import sys
 
-                print(f"Warning: Failed to parse document: {e}", file=sys.stderr)
+                print(
+                    f"Warning: Failed to parse document record ({type(e).__name__})",
+                    file=sys.stderr,
+                )
                 continue
 
         return documents

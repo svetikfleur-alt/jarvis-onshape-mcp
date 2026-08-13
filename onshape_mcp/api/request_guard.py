@@ -245,6 +245,13 @@ def safe_http_diagnostic(error: httpx.HTTPError) -> SafeHttpDiagnostic:
     )
 
 
+def safe_exception_message(error: BaseException) -> str:
+    """Preserve ordinary diagnostics while redacting HTTPX request details."""
+    if isinstance(error, httpx.HTTPError):
+        return str(safe_http_diagnostic(error))
+    return str(error)
+
+
 class LiveApiBudgetExceeded(RuntimeError):
     """Raised before an outbound send would exceed a configured live budget."""
 

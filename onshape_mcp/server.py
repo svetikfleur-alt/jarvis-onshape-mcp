@@ -19,7 +19,7 @@ _package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_package_dir, ".env"))
 
 from .api.client import OnshapeClient, OnshapeCredentials
-from .api.request_guard import safe_http_diagnostic
+from .api.request_guard import safe_exception_message, safe_http_diagnostic
 from .api.partstudio import PartStudioManager
 from .api.variables import VariableManager
 from .api.documents import DocumentManager
@@ -2810,9 +2810,7 @@ def _feature_apply_json(
 
 def _safe_exception_message(error: BaseException) -> str:
     """Preserve normal errors while sanitizing HTTPX exception strings."""
-    if isinstance(error, httpx.HTTPError):
-        return str(safe_http_diagnostic(error))
-    return str(error)
+    return safe_exception_message(error)
 
 
 def _log_unexpected_error(message: str, error: BaseException) -> None:
@@ -4504,7 +4502,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 ]
             except Exception as enum_err:  # noqa: BLE001
                 logger.warning(
-                    f"create_part_studio: failed to enumerate siblings: {enum_err}"
+                    "create_part_studio: failed to enumerate siblings: {}",
+                    _safe_exception_message(enum_err),
                 )
 
             payload = {

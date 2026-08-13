@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 
 
@@ -222,7 +224,7 @@ async def fetch_body_notices(
     try:
         resp = await client.post(path, data={"script": wrapped})
     except Exception as e:  # noqa: BLE001
-        logger.debug(f"fs body re-eval call failed: {e}")
+        logger.debug("fs body re-eval call failed: {}", safe_exception_message(e))
         return []
 
     notices = resp.get("notices") if isinstance(resp, dict) else None

@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 from .feature_apply import FeatureApplyResult, apply_feature_and_check
 from .fs_notices import extract_fs_body, fetch_body_notices, format_notices
@@ -326,7 +328,9 @@ class CustomFeatureManager:
                             f"{base}\nFS NOTICES:\n{rendered}".lstrip()
                         )
             except Exception as e:  # noqa: BLE001
-                logger.debug(f"FS body re-eval enrichment failed: {e}")
+                logger.debug(
+                    "FS body re-eval enrichment failed: {}", safe_exception_message(e)
+                )
 
         return {
             "apply_result": apply_result,

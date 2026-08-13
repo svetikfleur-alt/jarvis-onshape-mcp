@@ -20,6 +20,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from .client import OnshapeClient
+from .request_guard import safe_exception_message
 
 
 FeatureStatus = Literal["OK", "INFO", "WARNING", "ERROR", "UNKNOWN"]
@@ -108,7 +109,10 @@ async def apply_feature_and_check(
                 f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/massproperties"
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"track_changes: before-snapshot failed ({e}); skipping diff")
+            logger.warning(
+                "track_changes: before-snapshot failed ({}); skipping diff",
+                safe_exception_message(e),
+            )
             bodies_before = None
 
     response = await client.post(path, data=feature_payload)
@@ -133,7 +137,7 @@ async def apply_feature_and_check(
             feats = await client.get(base)
             state = (feats.get("featureStates") or {}).get(real_feature_id)
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Fallback /features GET failed: {e}")
+            logger.error("Fallback /features GET failed: {}", safe_exception_message(e))
             state = None
 
     raw_status: str = (state or {}).get("featureStatus", "UNKNOWN")
@@ -172,7 +176,9 @@ async def apply_feature_and_check(
                 mass_before=mass_before, mass_after=mass_after,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"track_changes: diff failed ({e}); skipping")
+            logger.warning(
+                "track_changes: diff failed ({}); skipping", safe_exception_message(e)
+            )
             changes = None
 
     return FeatureApplyResult(
@@ -242,7 +248,7 @@ async def apply_assembly_feature_and_check(
             feats = await client.get(base)
             state = (feats.get("featureStates") or {}).get(real_feature_id)
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Fallback /features GET failed: {e}")
+            logger.error("Fallback /features GET failed: {}", safe_exception_message(e))
             state = None
 
     raw_status: str = (state or {}).get("featureStatus", "UNKNOWN")
@@ -469,7 +475,7 @@ async def _fetch_feature_status_enum(
     try:
         resp = await client.post(path, data={"script": script})
     except Exception as e:  # noqa: BLE001
-        logger.debug(f"getFeatureStatus FS call failed: {e}")
+        logger.debug("getFeatureStatus FS call failed: {}", safe_exception_message(e))
         return None
 
     return _unwrap_fsvalue(resp.get("result"))
