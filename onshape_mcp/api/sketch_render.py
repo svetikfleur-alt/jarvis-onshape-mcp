@@ -35,6 +35,9 @@ _LABEL = (60, 60, 60)
 _FIX_MARK = (200, 40, 40)
 _DIM_LABEL = (30, 130, 60)
 _HV_LABEL = (140, 100, 30)
+_PADDING = 40
+_MIN_RENDER_DIMENSION = 2 * _PADDING + 1
+_MAX_RENDER_DIMENSION = 4096
 
 
 @dataclass
@@ -233,17 +236,30 @@ def _draw_arc(
     ex, ey = entity["end_mm"]
     a_start_world = math.degrees(math.atan2(sy - cy, sx - cx))
     a_end_world = math.degrees(math.atan2(ey - cy, ex - cx))
-    # Screen Y is flipped: negate.
-    a_start = -a_start_world
-    a_end = -a_end_world
-    # PIL.arc draws the shorter CCW sweep from start to end — normalize so
-    # we always go start -> end going CCW on screen.
-    if a_end < a_start:
-        a_end += 360.0
-    draw.arc(bbox, start=a_start, end=a_end, fill=color, width=2)
-    # Midpoint in mm (for labels).
-    a_mid_world = math.radians((a_start_world + (a_end_world if a_end_world > a_start_world else a_end_world + 360)) / 2)
-    return t.to_px(cx + r * math.cos(a_mid_world), cy + r * math.sin(a_mid_world))
+    # Screen Y is flipped: negate, then choose the endpoint ordering whose
+    # sweep matches the inspector's explicit angular extent. Pillow always
+    # draws toward increasing screen angles, so reversing the endpoints is
+    # necessary for ordinary counter-clockwise sketch arcs.
+    a_start = (-a_start_world) % 360.0
+    a_end = (-a_end_world) % 360.0
+    direct_sweep = (a_end - a_start) % 360.0
+    other_sweep = 360.0 - direct_sweep
+    target_sweep = abs(float(entity.get("sweep_deg", min(direct_sweep, other_sweep))))
+    if abs(direct_sweep - target_sweep) <= abs(other_sweep - target_sweep):
+        draw_start = a_start
+        draw_sweep = direct_sweep
+    else:
+        draw_start = a_end
+        draw_sweep = other_sweep
+    draw.arc(
+        bbox,
+        start=draw_start,
+        end=draw_start + draw_sweep,
+        fill=color,
+        width=2,
+    )
+    a_mid = math.radians(draw_start + draw_sweep / 2.0)
+    return uc + r_px * math.cos(a_mid), vc + r_px * math.sin(a_mid)
 
 
 def _draw_circle(
@@ -399,7 +415,18 @@ def render_sketch_png(
     (see `sketch_inspect.py`). Each entity has a `kind`, id, and coordinate
     fields in mm. Returns raw PNG bytes.
     """
-    pad = 40
+    if not _MIN_RENDER_DIMENSION <= width <= _MAX_RENDER_DIMENSION:
+        raise ValueError(
+            f"width must be between {_MIN_RENDER_DIMENSION} and "
+            f"{_MAX_RENDER_DIMENSION} pixels"
+        )
+    if not _MIN_RENDER_DIMENSION <= height <= _MAX_RENDER_DIMENSION:
+        raise ValueError(
+            f"height must be between {_MIN_RENDER_DIMENSION} and "
+            f"{_MAX_RENDER_DIMENSION} pixels"
+        )
+
+    pad = _PADDING
     img = Image.new("RGB", (width, height), _BG)
     draw = ImageDraw.Draw(img)
 

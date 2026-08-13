@@ -48,6 +48,7 @@ _DIM_PATTERNS = [
     (re.compile(r'^1:\d+$'), 'scale'),
     (re.compile(r'^\(?\d+(\.\d+)?\)?$'), 'length'),
 ]
+_MAX_CALLOUTS = 500
 
 
 def _classify(text: str) -> str:
@@ -123,6 +124,8 @@ def extract_callouts(image_path: str, min_confidence: int = 30,
             confidence=avg_conf,
             kind=kind,
         ))
+        if len(callouts) >= _MAX_CALLOUTS:
+            break
     return callouts
 
 
