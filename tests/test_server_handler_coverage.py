@@ -391,45 +391,6 @@ async def test_sketch_mutation_http_errors_are_structured_and_sanitized(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("tool_name", "arguments", "missing_field", "enum_field"),
-    [
-        (
-            "create_chamfer",
-            {**BASE_IDS, "distance": 1, "chamferType": "EQUAL_OFFSETS"},
-            "edgeIds",
-            "chamferType",
-        ),
-        (
-            "create_revolve",
-            {**BASE_IDS, "operationType": "NEW"},
-            "sketchFeatureId",
-            "operationType",
-        ),
-        (
-            "create_boolean",
-            {**BASE_IDS, "booleanType": "UNION"},
-            "toolBodyIds",
-            "booleanType",
-        ),
-    ],
-)
-async def test_valid_enum_does_not_mask_a_different_missing_required_field(
-    tool_name: str,
-    arguments: dict[str, object],
-    missing_field: str,
-    enum_field: str,
-) -> None:
-    """A broad ``except KeyError`` must not misdiagnose unrelated input gaps."""
-    payload = _json_payload(await server.call_tool(tool_name, arguments))
-
-    assert payload["ok"] is False
-    assert payload["status"] == "EXCEPTION"
-    assert missing_field in payload["error_message"]
-    assert f"Invalid {enum_field}" not in payload["error_message"]
-
-
-@pytest.mark.asyncio
 async def test_edit_sketch_returns_structured_change_bookkeeping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

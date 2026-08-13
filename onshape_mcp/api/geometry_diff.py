@@ -198,13 +198,11 @@ def _aggregate_volume_mm3(mass_props: Optional[Dict[str, Any]]) -> Optional[floa
             return float(vol[0]) * 1e9
         return None
     total = 0.0
-    measured = False
     for bdata in bodies.values():
         vol = bdata.get("volume") or []
         if isinstance(vol, list) and vol:
             total += float(vol[0]) * 1e9
-            measured = True
-    return total if measured else None
+    return total
 
 
 def compute_diff(

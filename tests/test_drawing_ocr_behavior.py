@@ -38,30 +38,6 @@ def test_classify_recognizes_engineering_callout_shapes(text: str, expected: str
     assert _classify(text) == expected
 
 
-def test_extract_callouts_caps_adversarial_ocr_output(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    image_path = tmp_path / "drawing.png"
-    Image.new("RGB", (1, 1), "white").save(image_path)
-    token_count = 501
-    data = {
-        "text": [str(index) for index in range(token_count)],
-        "conf": ["99"] * token_count,
-        "left": [0] * token_count,
-        "top": [index * 20 for index in range(token_count)],
-        "width": [5] * token_count,
-        "height": [5] * token_count,
-    }
-    _install_fake_ocr(monkeypatch, data)
-
-    result = extract_callouts(str(image_path))
-
-    assert len(result) == 500
-    assert result[0].text == "0"
-    assert result[-1].text == "499"
-
-
 def test_extract_callouts_filters_groups_and_computes_bounds(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

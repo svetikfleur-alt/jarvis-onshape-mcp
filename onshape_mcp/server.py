@@ -5121,18 +5121,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     elif name == "create_chamfer":
         try:
-            try:
-                chamfer_type = ChamferType[
-                    arguments.get("chamferType", "EQUAL_OFFSETS")
-                ]
-            except KeyError:
-                return [TextContent(type="text", text=_exception_json(
-                    ValueError(
-                        "Invalid chamferType; must be EQUAL_OFFSETS | "
-                        "TWO_OFFSETS | OFFSET_ANGLE"
-                    ),
-                    tool_name=name,
-                ))]
+            chamfer_type = ChamferType[arguments.get("chamferType", "EQUAL_OFFSETS")]
             chamfer = ChamferBuilder(name=arguments.get("name", "Chamfer"), distance=arguments["distance"], chamfer_type=chamfer_type)
             for edge_id in arguments["edgeIds"]:
                 chamfer.add_edge(edge_id)
@@ -5145,6 +5134,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 track_changes=bool(arguments.get("trackChanges", True)),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
+        except KeyError:
+            return [TextContent(type="text", text=_exception_json(
+                ValueError("Invalid chamferType; must be EQUAL_OFFSETS | TWO_OFFSETS | OFFSET_ANGLE"),
+                tool_name=name,
+            ))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
@@ -5218,15 +5212,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     elif name == "create_revolve":
         try:
-            try:
-                op_type = RevolveType[arguments.get("operationType", "NEW")]
-            except KeyError:
-                return [TextContent(type="text", text=_exception_json(
-                    ValueError(
-                        "Invalid operationType; must be NEW | ADD | REMOVE | INTERSECT"
-                    ),
-                    tool_name=name,
-                ))]
+            op_type = RevolveType[arguments.get("operationType", "NEW")]
             revolve = RevolveBuilder(
                 name=arguments.get("name", "Revolve"),
                 sketch_feature_id=arguments["sketchFeatureId"],
@@ -5241,6 +5227,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 track_changes=bool(arguments.get("trackChanges", True)),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
+        except KeyError:
+            return [TextContent(type="text", text=_exception_json(
+                ValueError("Invalid operationType; must be NEW | ADD | REMOVE | INTERSECT"),
+                tool_name=name,
+            ))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
@@ -5300,15 +5291,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     elif name == "create_boolean":
         try:
-            try:
-                bool_type = BooleanType[arguments["booleanType"]]
-            except KeyError:
-                return [TextContent(type="text", text=_exception_json(
-                    ValueError(
-                        "Invalid booleanType; must be UNION | SUBTRACT | INTERSECT"
-                    ),
-                    tool_name=name,
-                ))]
+            bool_type = BooleanType[arguments["booleanType"]]
             boolean = BooleanBuilder(name=arguments.get("name", "Boolean"), boolean_type=bool_type)
             for body_id in arguments["toolBodyIds"]:
                 boolean.add_tool_body(body_id)
@@ -5321,6 +5304,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 track_changes=bool(arguments.get("trackChanges", True)),
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
+        except KeyError:
+            return [TextContent(type="text", text=_exception_json(
+                ValueError("Invalid booleanType; must be UNION | SUBTRACT | INTERSECT"),
+                tool_name=name,
+            ))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:

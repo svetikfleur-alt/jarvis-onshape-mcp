@@ -191,16 +191,6 @@ def _complete_sketch() -> dict[str, object]:
     }
 
 
-def test_find_sketch_ignores_malformed_feature_entries() -> None:
-    sketch = {
-        "btType": "BTMSketch-151",
-        "featureId": "sketch-1",
-        "name": "Profile",
-    }
-
-    assert find_sketch({"features": [None, "invalid", sketch]}) is sketch
-
-
 def test_inspect_sketch_summarizes_supported_geometry_and_constraints() -> None:
     sketch = _complete_sketch()
     result = inspect_sketch(

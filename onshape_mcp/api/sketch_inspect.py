@@ -232,11 +232,7 @@ def find_sketch(
     exact `name`. Raises ValueError with the full available-id/name list if
     no match (to make wrong lookups easy to debug).
     """
-    features = [
-        feature
-        for feature in features_doc.get("features") or []
-        if isinstance(feature, dict)
-    ]
+    features: List[Dict[str, Any]] = features_doc.get("features") or []
     candidates = [f for f in features if f.get("btType") == "BTMSketch-151"]
 
     if sketch_feature_id:

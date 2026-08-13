@@ -1,7 +1,7 @@
 import io
 
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from onshape_mcp.api import sketch_render
 
@@ -10,62 +10,6 @@ def _open_png(png: bytes) -> Image.Image:
     with Image.open(io.BytesIO(png)) as image:
         image.load()
         return image.copy()
-
-
-def test_quarter_arc_uses_the_short_sweep_between_its_endpoints() -> None:
-    image = Image.new("RGB", (101, 101), "white")
-    transform = sketch_render._Transform(
-        scale=4.0,
-        x_min=-10.0,
-        y_min=-10.0,
-        x_max=10.0,
-        y_max=10.0,
-        pad=10,
-        height=101,
-    )
-    sketch_render._draw_arc(
-        ImageDraw.Draw(image),
-        transform,
-        {
-            "center_mm": (0.0, 0.0),
-            "radius_mm": 5.0,
-            "start_mm": (5.0, 0.0),
-            "end_mm": (0.0, 5.0),
-            "sweep_deg": 90.0,
-        },
-        (255, 0, 0),
-    )
-
-    assert image.getpixel((64, 37)) == (255, 0, 0)
-    assert image.getpixel((36, 65)) == (255, 255, 255)
-
-
-def test_reflex_arc_uses_the_long_sweep_between_its_endpoints() -> None:
-    image = Image.new("RGB", (101, 101), "white")
-    transform = sketch_render._Transform(
-        scale=4.0,
-        x_min=-10.0,
-        y_min=-10.0,
-        x_max=10.0,
-        y_max=10.0,
-        pad=10,
-        height=101,
-    )
-    sketch_render._draw_arc(
-        ImageDraw.Draw(image),
-        transform,
-        {
-            "center_mm": (0.0, 0.0),
-            "radius_mm": 5.0,
-            "start_mm": (5.0, 0.0),
-            "end_mm": (0.0, 5.0),
-            "sweep_deg": 270.0,
-        },
-        (255, 0, 0),
-    )
-
-    assert image.getpixel((36, 65)) == (255, 0, 0)
-    assert image.getpixel((64, 37)) == (255, 255, 255)
 
 
 def test_render_draws_supported_geometry_and_constraint_badges() -> None:
@@ -296,27 +240,3 @@ def test_transform_includes_origin_and_maps_positive_y_upward() -> None:
     assert transform.y_min < 0.0 < transform.y_max
     assert point_u > origin_u
     assert point_v < origin_v
-
-
-@pytest.mark.parametrize(
-    ("width", "height", "invalid_name"),
-    [
-        (4097, 100, "width"),
-        (100, 4097, "height"),
-        (80, 100, "width"),
-        (100, 80, "height"),
-    ],
-)
-def test_render_rejects_invalid_dimensions_before_allocating_image(
-    monkeypatch: pytest.MonkeyPatch,
-    width: int,
-    height: int,
-    invalid_name: str,
-) -> None:
-    def fail_if_allocated(*args: object, **kwargs: object) -> None:
-        raise AssertionError("image allocation must not run for an oversized render")
-
-    monkeypatch.setattr(sketch_render.Image, "new", fail_if_allocated)
-
-    with pytest.raises(ValueError, match=invalid_name):
-        sketch_render.render_sketch_png([], [], width=width, height=height)

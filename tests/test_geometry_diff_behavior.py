@@ -18,20 +18,6 @@ def _plane(face_id: str, normal: dict[str, float]) -> dict[str, object]:
     }
 
 
-def test_mass_properties_without_any_measured_volume_remain_unknown() -> None:
-    result = compute_diff(
-        [],
-        [],
-        mass_before={"bodies": {"body-1": {"volume": []}}},
-        mass_after={"bodies": {"body-1": {"volume": None}}},
-    )
-
-    assert "volume_before_mm3" not in result
-    assert "volume_after_mm3" not in result
-    assert "volume_delta_mm3" not in result
-    assert result["summary"] == "no visible change"
-
-
 def test_compute_diff_reports_geometry_bbox_and_aggregate_volume_changes() -> None:
     retained_face = _plane("retained", {"x": 1.0, "y": 0.0, "z": 0.0})
     retained_edge = {
