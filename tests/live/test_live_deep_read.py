@@ -73,6 +73,8 @@ def _has_useful_summary(parameter: dict[str, Any]) -> bool:
         if key not in parameter:
             continue
         summary = parameter[key]
+        if summary == "unsupported parameter type":
+            continue
         useful = bool(summary) if isinstance(summary, (str, list, dict)) else summary is not None
         if not useful:
             continue

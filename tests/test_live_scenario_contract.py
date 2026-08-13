@@ -51,6 +51,23 @@ def test_useful_normalized_parameters_requires_coherent_bounded_projection() -> 
                 "returned_parameters": 1,
                 "parameters": [
                     {
+                        "parameterId": "unsupported",
+                        "parameterType": "BTMParameterUnknown-999",
+                        "value_summary": "unsupported parameter type",
+                        "raw_available": True,
+                    }
+                ],
+            }
+        )
+        is False
+    )
+    assert (
+        _has_useful_normalized_parameters(
+            {
+                "parameter_count": 1,
+                "returned_parameters": 1,
+                "parameters": [
+                    {
                         "parameterId": "depth",
                         "parameterType": "BTMParameterQuantity-147",
                     }

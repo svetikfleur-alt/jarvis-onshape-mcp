@@ -87,6 +87,8 @@ from tests.conftest import *
 
 
 def _enable_readonly_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _LIVE_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     values = {
         "JARVIS_LIVE_TESTS": "1",
         "ONSHAPE_ACCESS_KEY": "access-canary",
@@ -97,6 +99,23 @@ def _enable_readonly_live(monkeypatch: pytest.MonkeyPatch) -> None:
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
+
+
+def test_enable_readonly_live_replaces_ambient_live_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ONSHAPE_API_KEY", "ambient-alternate-key")
+    monkeypatch.setenv("ONSHAPE_API_SECRET", "ambient-alternate-secret")
+    monkeypatch.setenv("JARVIS_LIVE_SUITE_BUDGET", "invalid-ambient-budget")
+
+    _enable_readonly_live(monkeypatch)
+    config = load_live_config()
+
+    assert config.access_key == "access-canary"
+    assert config.secret_key == "secret-canary"
+    assert config.suite_budget == 30
+    assert os.getenv("ONSHAPE_API_KEY") is None
+    assert os.getenv("ONSHAPE_API_SECRET") is None
 
 
 def test_subprocess_helper_forces_utf8_child_output(
@@ -710,7 +729,7 @@ async def test_guarded_loopback_is_counted_while_direct_network_remains_forbidde
     credentials = OnshapeCredentials(
         access_key=live_config.access_key,
         secret_key=live_config.secret_key,
-        base_url=f"http://127.0.0.1:{port}",
+        base_url=f"http://localhost:{port}",
     )
     try:
         async with OnshapeClient(credentials, transport=transport) as client:

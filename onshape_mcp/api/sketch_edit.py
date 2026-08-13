@@ -232,8 +232,9 @@ def _merge(
     unmatched = remove_set - existing_entity_ids - existing_constraint_ids
     if unmatched:
         logger.warning(
-            f"edit_sketch: removeIds did not match anything on the sketch: "
-            f"{sorted(unmatched)!r}. Maybe a typo or already-removed id?"
+            "edit_sketch: removeIds did not match anything on the sketch; "
+            "unmatched_count={}. Maybe a typo or already-removed id?",
+            len(unmatched),
         )
 
     return (

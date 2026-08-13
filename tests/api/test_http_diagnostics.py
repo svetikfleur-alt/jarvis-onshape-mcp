@@ -13,9 +13,13 @@ import pytest
 from loguru import logger
 
 from onshape_mcp.api import request_guard
+from onshape_mcp.api.custom_features import CustomFeatureManager
+from onshape_mcp.api.drawing_section import DrawingSectionManager
 from onshape_mcp.api.export import ExportManager
 from onshape_mcp.api.feature_apply import apply_feature_and_check
 from onshape_mcp.api.rendering import ShadedViewManager
+from onshape_mcp.api.sketch_edit import _merge
+from onshape_mcp.api.variables import VariableManager
 from onshape_mcp.server import _exception_json, call_tool
 
 
@@ -103,6 +107,149 @@ def test_safe_exception_message_redacts_http_but_preserves_non_http_detail():
     assert "/api/v9/documents/d/{documentId}" in message
     _assert_no_poison(message)
     assert request_guard.safe_exception_message(ValueError("useful-detail")) == "useful-detail"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manager_factory", "invoke"),
+    [
+        (
+            CustomFeatureManager,
+            lambda manager: manager.create_feature_studio(
+                PRIVATE_DOCUMENT_ID, PRIVATE_WORKSPACE_ID, "Safe name"
+            ),
+        ),
+        (
+            VariableManager,
+            lambda manager: manager.create_variable_studio(
+                PRIVATE_DOCUMENT_ID, PRIVATE_WORKSPACE_ID, "Safe name"
+            ),
+        ),
+        (
+            DrawingSectionManager,
+            lambda manager: manager.create_drawing(
+                PRIVATE_DOCUMENT_ID,
+                PRIVATE_WORKSPACE_ID,
+                drawing_name="Safe name",
+                part_studio_element_id=PRIVATE_ELEMENT_ID,
+            ),
+        ),
+        (
+            DrawingSectionManager,
+            lambda manager: manager._post_modify(
+                PRIVATE_DOCUMENT_ID,
+                PRIVATE_WORKSPACE_ID,
+                PRIVATE_ELEMENT_ID,
+                description="Safe description",
+                json_requests=[],
+            ),
+        ),
+    ],
+)
+async def test_missing_id_errors_never_embed_raw_onshape_response(
+    manager_factory, invoke
+):
+    poison_response = {
+        "raw": PRIVATE_BODY,
+        PRIVATE_DOCUMENT_ID: PRIVATE_QUERY,
+        "nested": {"elementId": PRIVATE_ELEMENT_ID},
+    }
+    client = Mock()
+    client.post = AsyncMock(return_value=poison_response)
+    manager = manager_factory(client)
+
+    with pytest.raises(RuntimeError) as raised:
+        await invoke(manager)
+
+    _assert_no_poison(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_public_variable_studio_handler_omits_poison_response_body():
+    client = Mock()
+    client.post = AsyncMock(return_value={"raw": PRIVATE_BODY, PRIVATE_DOCUMENT_ID: "x"})
+
+    with patch("onshape_mcp.server.variable_manager", VariableManager(client)):
+        result = await call_tool(
+            "create_variable_studio",
+            {
+                "documentId": PRIVATE_DOCUMENT_ID,
+                "workspaceId": PRIVATE_WORKSPACE_ID,
+                "name": "Safe name",
+            },
+        )
+
+    assert "Variable Studio creation returned no id" in result[0].text
+    _assert_no_poison(result[0].text)
+
+
+@pytest.mark.asyncio
+async def test_public_custom_feature_handler_omits_poison_response_body():
+    client = Mock()
+    client.post = AsyncMock(return_value={"raw": PRIVATE_BODY, PRIVATE_DOCUMENT_ID: "x"})
+
+    with patch("onshape_mcp.server.custom_feature_manager", CustomFeatureManager(client)):
+        result = await call_tool(
+            "write_featurescript_feature",
+            {
+                "documentId": PRIVATE_DOCUMENT_ID,
+                "workspaceId": PRIVATE_WORKSPACE_ID,
+                "elementId": PRIVATE_ELEMENT_ID,
+                "featureType": "safeFeature",
+                "featureScript": "annotation {} export const safeFeature = defineFeature(function() {});",
+                "featureName": "Safe name",
+            },
+        )
+
+    payload = json.loads(result[0].text)
+    assert payload["status"] == "EXCEPTION"
+    assert "Feature Studio creation returned no id" in payload["error_message"]
+    _assert_no_poison(payload)
+
+
+@pytest.mark.asyncio
+async def test_custom_feature_log_omits_namespace_identifiers():
+    events: list[str] = []
+    sink_id = logger.add(events.append, format="{message}", level="DEBUG")
+    manager = CustomFeatureManager(Mock())
+
+    try:
+        with patch(
+            "onshape_mcp.api.custom_features.apply_feature_and_check",
+            new=AsyncMock(return_value=Mock()),
+        ):
+            await manager.instantiate_custom_feature(
+                PRIVATE_DOCUMENT_ID,
+                PRIVATE_WORKSPACE_ID,
+                PRIVATE_ELEMENT_ID,
+                fs_element_id="private-feature-studio-canary",
+                source_microversion_id="private-microversion-canary",
+                feature_type="safeFeature",
+                feature_name="Safe name",
+                parameters=[],
+            )
+    finally:
+        logger.remove(sink_id)
+
+    output = "".join(events)
+    assert "featureType=safeFeature" in output
+    assert "param_count=0" in output
+    assert "private-feature-studio-canary" not in output
+    assert "private-microversion-canary" not in output
+
+
+def test_sketch_unmatched_remove_log_reports_count_without_entity_ids():
+    events: list[str] = []
+    sink_id = logger.add(events.append, format="{message}", level="WARNING")
+
+    try:
+        _merge([], [], [], [], [PRIVATE_ELEMENT_ID])
+    finally:
+        logger.remove(sink_id)
+
+    output = "".join(events)
+    assert "unmatched_count=1" in output
+    assert PRIVATE_ELEMENT_ID not in output
 
 
 def test_exception_json_sanitizes_request_error_without_losing_safe_context():

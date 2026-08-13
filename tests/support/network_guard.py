@@ -2,7 +2,8 @@
 
 import asyncio
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
+from functools import partial
 import socket
 
 
@@ -28,6 +29,8 @@ def _permit_guarded_network():
 
 def install_network_guard(monkeypatch) -> None:
     original_socketpair = socket.socketpair
+    original_getaddrinfo = socket.getaddrinfo
+    original_getnameinfo = socket.getnameinfo
 
     def guarded(original):
         def call(*args, **kwargs):
@@ -57,11 +60,29 @@ def install_network_guard(monkeypatch) -> None:
     for owner, name in guarded_boundaries:
         monkeypatch.setattr(owner, name, guarded(getattr(owner, name)))
     monkeypatch.setattr(socket, "socketpair", local_socketpair)
-    for name in ("getaddrinfo", "getnameinfo"):
-        if hasattr(asyncio.BaseEventLoop, name):
-            monkeypatch.setattr(
-                asyncio.BaseEventLoop, name, guarded(getattr(asyncio.BaseEventLoop, name))
-            )
+    async def guarded_getaddrinfo(
+        loop, host, port, *, family=0, type=0, proto=0, flags=0
+    ):
+        _require_permit()
+        resolve = partial(
+            copy_context().run,
+            original_getaddrinfo,
+            host,
+            port,
+            family,
+            type,
+            proto,
+            flags,
+        )
+        return await loop.run_in_executor(None, resolve)
+
+    async def guarded_getnameinfo(loop, sockaddr, flags=0):
+        _require_permit()
+        resolve = partial(copy_context().run, original_getnameinfo, sockaddr, flags)
+        return await loop.run_in_executor(None, resolve)
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "getaddrinfo", guarded_getaddrinfo)
+    monkeypatch.setattr(asyncio.BaseEventLoop, "getnameinfo", guarded_getnameinfo)
     loop_classes = [asyncio.BaseEventLoop]
     try:
         from asyncio.selector_events import BaseSelectorEventLoop
