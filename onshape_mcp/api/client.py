@@ -6,6 +6,30 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from loguru import logger
 
+from .request_guard import RequestDescriptor, sanitize_request
+
+
+def _safe_status_descriptor(request: object) -> RequestDescriptor:
+    """Build a diagnostic descriptor without retaining request URL details."""
+    if isinstance(request, httpx.Request):
+        return sanitize_request(request.method, request.url)
+    return RequestDescriptor(method="UNKNOWN", path="/{opaque}")
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """Raise an HTTPX status error whose text cannot disclose raw URL details."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        descriptor = _safe_status_descriptor(error.request)
+        status = response.status_code if isinstance(response.status_code, int) else "unknown"
+        raise httpx.HTTPStatusError(
+            f"Onshape API request failed: status={status}; "
+            f"request={descriptor.method} {descriptor.path}",
+            request=error.request,
+            response=error.response,
+        ) from None
+
 
 class OnshapeCredentials(BaseModel):
     """Onshape API credentials."""
@@ -83,7 +107,7 @@ class OnshapeClient:
 
         self._ensure_client()
         response = await self._client.get(url, params=params, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
         result = response.json()
         logger.debug("Onshape GET request completed with status {}", response.status_code)
         return result
@@ -117,7 +141,7 @@ class OnshapeClient:
         response = await self._client.get(
             url, params=params, headers=headers, follow_redirects=follow_redirects
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         logger.debug("Onshape raw GET request completed with status {}", response.status_code)
         return response.content
 
@@ -151,7 +175,7 @@ class OnshapeClient:
         if response.status_code >= 400:
             logger.error("Onshape POST request failed with status {}", response.status_code)
 
-        response.raise_for_status()
+        _raise_for_status(response)
         if not response.content:
             logger.debug("Onshape POST request completed with status {}", response.status_code)
             return {}
@@ -177,7 +201,7 @@ class OnshapeClient:
 
         self._ensure_client()
         response = await self._client.delete(url, params=params, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
         if not response.content:
             return {}
         return response.json()

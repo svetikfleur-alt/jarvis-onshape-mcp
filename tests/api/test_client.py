@@ -124,6 +124,28 @@ class TestOnshapeClient:
         assert "query-canary" not in diagnostics
         assert "response-canary" not in diagnostics
 
+    @pytest.mark.asyncio
+    async def test_http_status_exception_omits_raw_url_and_query_canaries(self, mock_credentials):
+        """HTTP status failures must retain status information without leaking URLs."""
+
+        class ErrorTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(404, request=request, json={"error": "response-canary"})
+
+        client = OnshapeClient(mock_credentials, transport=ErrorTransport())
+
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await client.get(
+                "/api/v9/documents/d/private-path-canary",
+                params={"secret": "private-query-canary"},
+            )
+        await client.close()
+
+        message = str(caught.value)
+        assert "404" in message
+        assert "private-path-canary" not in message
+        assert "private-query-canary" not in message
+
     def test_get_auth_header_encoding(self, mock_credentials):
         """Test Basic Auth header generation."""
         client = OnshapeClient(mock_credentials)

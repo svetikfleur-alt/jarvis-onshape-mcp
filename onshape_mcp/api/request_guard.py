@@ -81,21 +81,20 @@ class LiveApiBudgetExceeded(RuntimeError):
     def __init__(
         self,
         descriptor: RequestDescriptor,
-        test_name: str,
         test_used: int,
         test_limit: int,
         suite_used: int,
         suite_limit: int,
     ) -> None:
         self.descriptor = descriptor
-        self.test_name = test_name
+        self.test_name = None
         self.test_used = test_used
         self.test_limit = test_limit
         self.suite_used = suite_used
         self.suite_limit = suite_limit
         super().__init__(
             f"{self.code}: request={descriptor.method} {descriptor.path}; "
-            f"test={test_name} used={test_used}/{test_limit}; "
+            f"test used={test_used}/{test_limit}; "
             f"suite used={suite_used}/{suite_limit}"
         )
 
@@ -134,7 +133,6 @@ class LiveBudgetGuard:
                 suite.blocked += 1
                 raise LiveApiBudgetExceeded(
                     request,
-                    self.test_name,
                     self.used,
                     self.test_limit,
                     suite.used,

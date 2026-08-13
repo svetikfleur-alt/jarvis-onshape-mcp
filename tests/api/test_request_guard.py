@@ -21,10 +21,14 @@ class CountingTransport(httpx.AsyncBaseTransport):
 
     def __init__(self) -> None:
         self.calls = 0
+        self.close_calls = 0
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.calls += 1
         return httpx.Response(200, request=request, json={"ok": True})
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 class RedirectTransport(httpx.AsyncBaseTransport):
@@ -98,6 +102,18 @@ def test_read_only_budget_overflow_does_not_consume_a_physical_send():
     assert suite.used == 1
     assert suite.blocked == 1
     assert caught.value.code == "LIVE_API_BUDGET_EXCEEDED"
+
+
+def test_budget_exception_omits_private_test_identifier_from_text_and_fields():
+    suite = LiveSuiteBudget(limit=1)
+    guard = LiveBudgetGuard("private-test-name-canary", 1, suite)
+    guard.reserve()
+
+    with pytest.raises(LiveApiBudgetExceeded) as caught:
+        guard.reserve()
+
+    assert "private-test-name-canary" not in str(caught.value)
+    assert caught.value.test_name is None
 
 
 def test_suite_budget_overflow_does_not_consume_a_physical_send():
@@ -266,3 +282,14 @@ async def test_permit_scopes_only_the_inner_transport_delegate():
         await client.get("https://cad.onshape.com/api/v9/documents/d/private-id")
 
     assert events == ["enter", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_aclose_delegates_once_to_the_injected_transport():
+    suite = LiveSuiteBudget(limit=1)
+    inner = CountingTransport()
+    transport = BudgetedAsyncTransport(inner, LiveBudgetGuard("LIVE-DEEP-READ-01", 1, suite))
+
+    await transport.aclose()
+
+    assert inner.close_calls == 1
