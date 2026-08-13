@@ -304,6 +304,90 @@ async def _run_unresolved_gate_replay(
     }
 
 
+async def _run_stress_replay(
+    monkeypatch: pytest.MonkeyPatch, *, feature_count: int, name_size: int
+) -> dict[str, Any]:
+    raw_features = {
+        "serializationVersion": "1.2.3",
+        "sourceMicroversion": "synthetic-stress-microversion",
+        "features": [
+            {
+                "btType": "BTMSketch-151",
+                "featureId": f"feature-{index:03d}",
+                "featureType": "newSketch",
+                "name": f"Feature {index:03d} " + ("x" * name_size),
+                "suppressed": False,
+                "parameters": [
+                    {
+                        "btType": "BTMParameterUnknown-999",
+                        "parameterId": "private-extension",
+                        "unsupportedRaw": {
+                            "poisonCanary": f"RAW_POISON_STRESS_PRIVATE_{index:03d}"
+                        },
+                    }
+                ],
+            }
+            for index in range(feature_count)
+        ],
+        "featureStates": {
+            f"feature-{index:03d}": {"featureStatus": "OK", "messages": []}
+            for index in range(feature_count)
+        },
+    }
+    request_paths: list[str] = []
+
+    async def replay_response(request: httpx.Request) -> httpx.Response:
+        request_paths.append(request.url.path)
+        assert request.method == "GET"
+        assert request.url.path == "/api/v9/partstudios/d/doc/w/ws/e/el/features"
+        return httpx.Response(200, json=raw_features)
+
+    suite = LiveSuiteBudget(limit=1)
+    guard = LiveBudgetGuard("LIVE-DEEP-READ-01", 1, suite)
+    transport = BudgetedAsyncTransport(httpx.MockTransport(replay_response), guard)
+    client = OnshapeClient(
+        OnshapeCredentials(
+            access_key="synthetic-access",
+            secret_key="synthetic-secret",
+            base_url="https://fixture.invalid",
+        ),
+        transport=transport,
+    )
+    monkeypatch.setattr(server, "partstudio_manager", PartStudioManager(client))
+    monkeypatch.setattr(server, "context_store", ContextStore())
+
+    try:
+        started = _decode(
+            await server.call_tool(
+                "start_model_context",
+                {"documentId": "doc", "workspaceId": "ws", "elementId": "el"},
+            )
+        )
+        handle = started["context_handle"]
+        first_page = _decode(
+            await server.call_tool(
+                "get_feature_tree_compact",
+                {"contextHandle": handle, "offset": 0, "limit": 500},
+            )
+        )
+        continuation = _decode(
+            await server.call_tool(
+                "get_feature_tree_compact",
+                {"contextHandle": handle, "offset": 50, "limit": 500},
+            )
+        )
+    finally:
+        await client.close()
+
+    return {
+        "first_page": first_page,
+        "continuation": continuation,
+        "request_count": len(request_paths),
+        "guard_used": guard.used,
+        "suite_used": suite.used,
+    }
+
+
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_public_partstudio_fixtures_have_provenance_and_private_poison(name: str) -> None:
     fixture = partstudio_fixture(name)
@@ -414,3 +498,54 @@ async def test_gate_precedes_cached_access_and_unresolved_geometry_stays_honest(
         envelope["cost"]["inline_bytes"] <= 32768
         for envelope in replay["envelopes"]
     )
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_compact_tree_enforces_page_cap_and_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = await _run_stress_replay(monkeypatch, feature_count=75, name_size=0)
+
+    first = replay["first_page"]
+    continuation = replay["continuation"]
+    assert first["data"]["total"] == 75
+    assert first["data"]["offset"] == 0
+    assert first["data"]["returned"] == 50
+    assert len(first["data"]["rows"]) == 50
+    assert first["data"]["has_more"] is True
+    assert first["data"]["rows"][0]["ordinal"] == 1
+    assert first["data"]["rows"][-1]["ordinal"] == 50
+    assert continuation["data"]["total"] == 75
+    assert continuation["data"]["offset"] == 50
+    assert continuation["data"]["returned"] == 25
+    assert len(continuation["data"]["rows"]) == 25
+    assert continuation["data"]["has_more"] is False
+    assert continuation["data"]["rows"][0]["ordinal"] == 51
+    assert continuation["data"]["rows"][-1]["ordinal"] == 75
+    assert len(json.dumps(first).encode("utf-8")) <= 32768
+    assert len(json.dumps(continuation).encode("utf-8")) <= 32768
+    assert replay["request_count"] == 1
+    assert replay["guard_used"] == 1
+    assert replay["suite_used"] == 1
+
+
+@pytest.mark.asyncio
+async def test_public_mcp_compact_tree_bounds_oversized_normalized_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay = await _run_stress_replay(monkeypatch, feature_count=50, name_size=2000)
+
+    page = replay["first_page"]
+    encoded = json.dumps(page, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    assert page["truncated"] is True
+    assert page["data"]["returned"] < 50
+    assert page["data"]["returned"] == len(page["data"]["rows"])
+    assert page["data"]["has_more"] is True
+    assert len(encoded.encode("utf-8")) <= 32768
+    assert page["cost"]["inline_bytes"] == len(encoded.encode("utf-8"))
+    assert "RAW_POISON_STRESS_PRIVATE" not in encoded
+    assert "unsupportedRaw" not in encoded
+    assert not _contains_key(page, "features")
+    assert replay["request_count"] == 1
+    assert replay["guard_used"] == 1
+    assert replay["suite_used"] == 1
