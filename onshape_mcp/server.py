@@ -39,14 +39,13 @@ from .api.feature_apply import (
 from .api.entities import EntityManager
 from .api.describe import DescribeManager
 from .api.measurements import MeasurementManager
-from .api.custom_features import CustomFeatureManager, DEFAULT_FS_VERSION
+from .api.custom_features import CustomFeatureManager
 from .api.drawing_ocr import callouts_to_dict, extract_callouts
 from .api.rendering import (
     ShadedViewManager,
     compose_reference_comparison,
     crop_cached_image,
     get_image,
-    get_image_meta,
     list_cached_image_ids,
     load_local_image,
     _put_image,
@@ -62,10 +61,20 @@ from .builders.boolean import BooleanBuilder, BooleanType
 from .analysis.interference import check_assembly_interference, format_interference_result
 from .analysis.positioning import get_assembly_positions, set_absolute_position, align_to_face
 from .governance import (
+    BudgetState,
     ContextNotFoundError,
     ContextStore,
+    FeatureNotFoundError,
+    GovernanceBudgetError,
+    MAX_DEPENDENCY_ROWS,
+    MAX_FEATURE_RESULTS,
+    MAX_INSPECTION_PARAMETERS,
+    MAX_SLICE_DEPTH,
+    MAX_SLICE_EDGES,
+    MAX_SLICE_NODES,
     ObservationEnvelope,
-    compact_feature_page,
+    WorkingStateFieldForbiddenError,
+    WorkingStateValidationError,
     serialize_bounded,
     summarize_features,
 )
@@ -122,7 +131,8 @@ list_entities, or from create_offset_plane).
 - update_feature — patch params on an existing feature (iteration)
 
 ### Introspection (USE OFTEN)
-- start_model_context / get_feature_tree_compact / get_context_status — bounded onboarding and cached feature-tree reads
+- start_model_context / get_feature_tree_compact / find_features / inspect_feature — bounded cached feature intelligence
+- inspect_feature_dependencies / get_dependency_slice / update_working_state / get_context_status — local dependency navigation and working state
 - describe_part_studio — topology + multi-view renders in one call. First stop after every mutation.
 - list_entities — faces/edges/vertices with filters: outward_axis, at_z_mm, geometryType, radius_range_mm, length_range_mm
 - get_features / get_body_details — feature tree with statuses, per-part face/edge IDs
@@ -209,6 +219,47 @@ def _context_not_found_content(error: ContextNotFoundError) -> list[TextContent]
             text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
     ]
+
+
+def _governance_error_content(
+    record: Any,
+    *,
+    level: str,
+    error_type: str,
+    message: str,
+    details: Optional[dict[str, Any]] = None,
+) -> list[TextContent]:
+    error = {"type": error_type, "message": message}
+    if details:
+        error.update(details)
+    envelope = ObservationEnvelope(
+        context_handle=record.working_state.context_handle,
+        level=level,
+        summary={"message": message},
+        data={},
+        error=error,
+        cache=ContextStore.cache_projection(record),
+    )
+    return _governance_content(envelope, record)
+
+
+def _governance_context_not_found_content(
+    error: ContextNotFoundError, *, level: str
+) -> list[TextContent]:
+    budget = BudgetState()
+    envelope = ObservationEnvelope(
+        context_handle=error.context_handle[:128],
+        level=level,
+        summary={"message": "Unknown context handle"},
+        data={},
+        error={
+            "type": "CONTEXT_NOT_FOUND",
+            "message": "Unknown context handle",
+            "context_handle": error.context_handle[:128],
+        },
+    )
+    text = serialize_bounded(envelope, context_store.policy, budget)
+    return [TextContent(type="text", text=text)]
 
 
 @app.list_tools()
@@ -542,6 +593,179 @@ async def list_tools() -> list[Tool]:
                     "query": {"type": "string", "description": "Optional name, ID, or type query"},
                 },
                 "required": ["contextHandle"],
+            },
+        ),
+        Tool(
+            name="find_features",
+            description=(
+                "Search the cached normalized feature index with bounded AND-combined filters. "
+                "Makes no Onshape request."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "query": {"type": "string", "description": "Case-insensitive text query"},
+                    "featureType": {"type": "string", "description": "Exact feature-type filter"},
+                    "status": {"type": "string", "description": "Exact feature-status filter"},
+                    "suppressed": {"type": "boolean"},
+                    "fromOrdinal": {"type": "integer", "minimum": 1},
+                    "toOrdinal": {"type": "integer", "minimum": 1},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_FEATURE_RESULTS,
+                        "default": 20,
+                    },
+                },
+                "required": ["contextHandle"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="inspect_feature",
+            description=(
+                "Inspect one cached feature as bounded normalized detail; raw parameter objects "
+                "are never returned."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "featureId": {"type": "string", "description": "Exact cached feature ID"},
+                    "includeParameters": {"type": "boolean", "default": True},
+                    "maxParameters": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_INSPECTION_PARAMETERS,
+                        "default": 40,
+                    },
+                },
+                "required": ["contextHandle", "featureId"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="inspect_feature_dependencies",
+            description=(
+                "Read conservative upstream/downstream feature references and unresolved cached "
+                "geometry references without guessing provenance."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "featureId": {"type": "string", "description": "Exact cached feature ID"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_DEPENDENCY_ROWS,
+                        "default": 30,
+                    },
+                },
+                "required": ["contextHandle", "featureId"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_dependency_slice",
+            description=(
+                "Traverse a deterministic bounded local region of the cached feature-dependency "
+                "graph. Makes no Onshape request."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "featureId": {"type": "string", "description": "Root cached feature ID"},
+                    "direction": {
+                        "type": "string",
+                        "enum": ["upstream", "downstream", "both"],
+                        "default": "both",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SLICE_DEPTH,
+                        "default": 1,
+                    },
+                    "maxNodes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SLICE_NODES,
+                        "default": 40,
+                    },
+                    "maxEdges": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SLICE_EDGES,
+                        "default": 80,
+                    },
+                },
+                "required": ["contextHandle", "featureId"],
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="update_working_state",
+            description=(
+                "Update bounded model-investigation focus, hypotheses, evidence, next action, "
+                "or phase. Identity, revision, and budget fields are immutable."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "contextHandle": {"type": "string", "description": "Opaque model context handle"},
+                    "focusFeatureIds": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 128},
+                        "maxItems": 12,
+                    },
+                    "hypotheses": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "hypothesisId": {"type": "string", "maxLength": 64},
+                                "claim": {"type": "string", "maxLength": 500},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["open", "supported", "rejected", "resolved"],
+                                    "default": "open",
+                                },
+                                "evidenceRefs": {
+                                    "type": "array",
+                                    "items": {"type": "string", "maxLength": 128},
+                                    "maxItems": 20,
+                                },
+                            },
+                            "required": ["hypothesisId", "claim"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "evidenceRefs": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 128},
+                        "maxItems": 20,
+                    },
+                    "nextAction": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "capability": {"type": "string", "maxLength": 128},
+                            "targets": {
+                                "type": "array",
+                                "items": {"type": "string", "maxLength": 128},
+                                "maxItems": 12,
+                            },
+                        },
+                        "required": ["capability"],
+                        "additionalProperties": False,
+                    },
+                    "phase": {"type": "string", "maxLength": 32},
+                },
+                "required": ["contextHandle"],
+                "additionalProperties": False,
             },
         ),
         Tool(
@@ -3238,14 +3462,28 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 1,
                 min(requested_limit, context_store.policy.max_feature_rows, 50),
             )
-            record.working_state.budget.record_call()
-            context_store.record_cache_read(record.working_state.context_handle)
-            page = compact_feature_page(
-                record.raw_features,
+            context_store.begin_operation(
+                record.working_state.context_handle, exploratory_read=True
+            )
+            index, index_hit = context_store.get_feature_index(
+                record.working_state.context_handle
+            )
+            scope = {
+                "offset": offset,
+                "limit": limit,
+                "status": arguments.get("status"),
+                "query": arguments.get("query"),
+            }
+            cache_repeat = context_store.record_cache_read(
+                record.working_state.context_handle,
+                tool_name=name,
+                scope=scope,
+            )
+            page = index.compact_page(
                 offset=offset,
                 limit=limit,
-                status_filter=arguments.get("status"),
-                text_query=arguments.get("query"),
+                status=arguments.get("status"),
+                query=arguments.get("query"),
             )
             envelope = ObservationEnvelope(
                 context_handle=record.working_state.context_handle,
@@ -3253,9 +3491,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 summary={"matching_feature_count": page["total"]},
                 data=page,
                 truncated=page["has_more"],
-                cache=dict(record.cache_metadata),
+                cache=ContextStore.cache_projection(
+                    record,
+                    index_hit=index_hit,
+                    cache_repeat=cache_repeat,
+                ),
             )
             return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L1",
+                error_type=e.error_type,
+                message=e.message,
+            )
         except (TypeError, ValueError):
             payload = {
                 "error": {
@@ -3265,13 +3514,348 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             }
             return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
 
+    elif name == "find_features":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _governance_context_not_found_content(e, level="L1")
+
+        try:
+            requested_limit = int(arguments.get("limit", 20))
+            limit = max(1, min(requested_limit, MAX_FEATURE_RESULTS))
+            from_ordinal = arguments.get("fromOrdinal")
+            to_ordinal = arguments.get("toOrdinal")
+            if from_ordinal is not None:
+                from_ordinal = int(from_ordinal)
+            if to_ordinal is not None:
+                to_ordinal = int(to_ordinal)
+            context_store.begin_operation(
+                record.working_state.context_handle, exploratory_read=True
+            )
+            index, index_hit = context_store.get_feature_index(
+                record.working_state.context_handle
+            )
+            scope = {
+                "query": arguments.get("query"),
+                "featureType": arguments.get("featureType"),
+                "status": arguments.get("status"),
+                "suppressed": arguments.get("suppressed"),
+                "fromOrdinal": from_ordinal,
+                "toOrdinal": to_ordinal,
+                "limit": limit,
+            }
+            cache_repeat = context_store.record_cache_read(
+                record.working_state.context_handle,
+                tool_name=name,
+                scope=scope,
+            )
+            result = index.search(
+                query=arguments.get("query"),
+                feature_type=arguments.get("featureType"),
+                status=arguments.get("status"),
+                suppressed=arguments.get("suppressed"),
+                from_ordinal=from_ordinal,
+                to_ordinal=to_ordinal,
+                limit=limit,
+            )
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L1",
+                summary={"matching_feature_count": result["total"]},
+                data=result,
+                truncated=result["has_more"],
+                cache=ContextStore.cache_projection(
+                    record,
+                    index_hit=index_hit,
+                    cache_repeat=cache_repeat,
+                ),
+            )
+            return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L1",
+                error_type=e.error_type,
+                message=e.message,
+            )
+        except (TypeError, ValueError) as e:
+            return _governance_error_content(
+                record,
+                level="L1",
+                error_type="INVALID_ARGUMENT",
+                message=str(e)[:256] or "Invalid feature-search arguments",
+            )
+
+    elif name == "inspect_feature":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _governance_context_not_found_content(e, level="L3")
+
+        try:
+            requested_max = int(arguments.get("maxParameters", 40))
+            max_parameters = max(1, min(requested_max, MAX_INSPECTION_PARAMETERS))
+            include_parameters = bool(arguments.get("includeParameters", True))
+            context_store.begin_operation(
+                record.working_state.context_handle, exploratory_read=True
+            )
+            index, index_hit = context_store.get_feature_index(
+                record.working_state.context_handle
+            )
+            scope = {
+                "featureId": arguments["featureId"],
+                "includeParameters": include_parameters,
+                "maxParameters": max_parameters,
+            }
+            cache_repeat = context_store.record_cache_read(
+                record.working_state.context_handle,
+                tool_name=name,
+                scope=scope,
+            )
+            detail = index.inspect(
+                arguments["featureId"],
+                include_parameters=include_parameters,
+                max_parameters=max_parameters,
+            )
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L3",
+                summary={
+                    "featureId": detail["featureId"],
+                    "name": detail["name"],
+                    "status": detail["status"],
+                },
+                data={"feature": detail},
+                truncated=detail["truncated"],
+                cache=ContextStore.cache_projection(
+                    record,
+                    index_hit=index_hit,
+                    cache_repeat=cache_repeat,
+                ),
+            )
+            return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type=e.error_type,
+                message=e.message,
+            )
+        except FeatureNotFoundError as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type="FEATURE_NOT_FOUND",
+                message="Feature not found in cached model context",
+                details={"feature_id": e.feature_id},
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type="INVALID_ARGUMENT",
+                message=str(e)[:256] or "Invalid feature-inspection arguments",
+            )
+
+    elif name == "inspect_feature_dependencies":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _governance_context_not_found_content(e, level="L3")
+
+        try:
+            requested_limit = int(arguments.get("limit", 30))
+            limit = max(1, min(requested_limit, MAX_DEPENDENCY_ROWS))
+            context_store.begin_operation(
+                record.working_state.context_handle, exploratory_read=True
+            )
+            index, index_hit = context_store.get_feature_index(
+                record.working_state.context_handle
+            )
+            scope = {"featureId": arguments["featureId"], "limit": limit}
+            cache_repeat = context_store.record_cache_read(
+                record.working_state.context_handle,
+                tool_name=name,
+                scope=scope,
+            )
+            result = index.dependencies(arguments["featureId"], limit=limit)
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L3",
+                summary={
+                    "featureId": arguments["featureId"],
+                    "upstream_count": len(result["upstream"]),
+                    "downstream_count": len(result["downstream"]),
+                    "unresolved_reference_count": len(result["unresolved_references"]),
+                },
+                data=result,
+                truncated=result["truncated"],
+                cache=ContextStore.cache_projection(
+                    record,
+                    index_hit=index_hit,
+                    cache_repeat=cache_repeat,
+                ),
+            )
+            return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type=e.error_type,
+                message=e.message,
+            )
+        except FeatureNotFoundError as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type="FEATURE_NOT_FOUND",
+                message="Feature not found in cached model context",
+                details={"feature_id": e.feature_id},
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            return _governance_error_content(
+                record,
+                level="L3",
+                error_type="INVALID_ARGUMENT",
+                message=str(e)[:256] or "Invalid dependency-inspection arguments",
+            )
+
+    elif name == "get_dependency_slice":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _governance_context_not_found_content(e, level="L2")
+
+        try:
+            direction = arguments.get("direction", "both")
+            depth = max(1, min(int(arguments.get("depth", 1)), MAX_SLICE_DEPTH))
+            max_nodes = max(1, min(int(arguments.get("maxNodes", 40)), MAX_SLICE_NODES))
+            max_edges = max(1, min(int(arguments.get("maxEdges", 80)), MAX_SLICE_EDGES))
+            context_store.begin_operation(
+                record.working_state.context_handle, exploratory_read=True
+            )
+            index, index_hit = context_store.get_feature_index(
+                record.working_state.context_handle
+            )
+            scope = {
+                "featureId": arguments["featureId"],
+                "direction": direction,
+                "depth": depth,
+                "maxNodes": max_nodes,
+                "maxEdges": max_edges,
+            }
+            cache_repeat = context_store.record_cache_read(
+                record.working_state.context_handle,
+                tool_name=name,
+                scope=scope,
+            )
+            result = index.dependency_slice(
+                arguments["featureId"],
+                direction=direction,
+                depth=depth,
+                max_nodes=max_nodes,
+                max_edges=max_edges,
+            )
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L2",
+                summary={
+                    "root_feature_id": arguments["featureId"],
+                    "node_count": len(result["nodes"]),
+                    "edge_count": len(result["edges"]),
+                },
+                data=result,
+                truncated=result["truncated"],
+                cache=ContextStore.cache_projection(
+                    record,
+                    index_hit=index_hit,
+                    cache_repeat=cache_repeat,
+                ),
+            )
+            return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L2",
+                error_type=e.error_type,
+                message=e.message,
+            )
+        except FeatureNotFoundError as e:
+            return _governance_error_content(
+                record,
+                level="L2",
+                error_type="FEATURE_NOT_FOUND",
+                message="Feature not found in cached model context",
+                details={"feature_id": e.feature_id},
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            return _governance_error_content(
+                record,
+                level="L2",
+                error_type="INVALID_ARGUMENT",
+                message=str(e)[:256] or "Invalid dependency-slice arguments",
+            )
+
+    elif name == "update_working_state":
+        try:
+            record = context_store.get(arguments["contextHandle"])
+        except ContextNotFoundError as e:
+            return _governance_context_not_found_content(e, level="L0")
+
+        try:
+            context_store.begin_operation(record.working_state.context_handle)
+            record, meaningful = context_store.update_working_state(
+                record.working_state.context_handle, arguments
+            )
+            envelope = ObservationEnvelope(
+                context_handle=record.working_state.context_handle,
+                level="L0",
+                summary={"phase": record.working_state.phase},
+                data={
+                    "working_state": record.working_state.projection(),
+                    "meaningful_update": meaningful,
+                },
+                cache=ContextStore.cache_projection(record),
+            )
+            return _governance_content(envelope, record)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L0",
+                error_type=e.error_type,
+                message=e.message,
+            )
+        except WorkingStateFieldForbiddenError as e:
+            return _governance_error_content(
+                record,
+                level="L0",
+                error_type="WORKING_STATE_FIELD_FORBIDDEN",
+                message="Working state update contains immutable or unsupported fields",
+                details={"fields": e.fields[:20]},
+            )
+        except WorkingStateValidationError as e:
+            return _governance_error_content(
+                record,
+                level="L0",
+                error_type="WORKING_STATE_INVALID",
+                message=str(e)[:256],
+            )
+
     elif name == "get_context_status":
         try:
             record = context_store.get(arguments["contextHandle"])
         except ContextNotFoundError as e:
             return _context_not_found_content(e)
 
-        record.working_state.budget.record_call()
+        try:
+            context_store.begin_operation(record.working_state.context_handle)
+        except GovernanceBudgetError as e:
+            return _governance_error_content(
+                record,
+                level="L0",
+                error_type=e.error_type,
+                message=e.message,
+            )
         state = record.working_state
         policy = context_store.policy
         data = {
@@ -3279,7 +3863,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             "revision_id": state.revision_id,
             "phase": state.phase,
             "focus": list(state.focus),
-            "cache": dict(record.cache_metadata),
+            "hypotheses": [item.to_dict() for item in state.hypotheses],
+            "evidence_refs": list(state.evidence_refs),
+            "next_action": state.next_action.to_dict() if state.next_action else None,
+            "cache": ContextStore.cache_projection(record),
             "budget": {
                 "policy": dict(vars(policy)),
                 "used": state.budget.used(),
@@ -3292,7 +3879,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             level="L0",
             summary={"phase": state.phase},
             data=data,
-            cache=dict(record.cache_metadata),
+            cache=ContextStore.cache_projection(record),
         )
         return _governance_content(envelope, record)
 
@@ -3819,7 +4406,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                     "create_document: post-create workspace/elementId resolution failed"
                 )
 
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "ok": True,
                 "document_id": doc.id,
                 "document_name": doc.name,

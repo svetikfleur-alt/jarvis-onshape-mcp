@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -16,19 +18,38 @@ class ContextNotFoundError(LookupError):
         self.context_handle = context_handle
 
 
+class GovernanceBudgetError(RuntimeError):
+    """A bounded governance operation was refused before accessing cached data."""
+
+    def __init__(self, error_type: str, message: str):
+        super().__init__(message)
+        self.error_type = error_type
+        self.message = message
+
+
+class WorkingStateFieldForbiddenError(ValueError):
+    def __init__(self, fields: list[str]):
+        super().__init__("Working state update contains fields that clients cannot modify")
+        self.fields = fields
+
+
 @dataclass
 class ReadLedger:
     onshape_reads: int = 0
     cache_reads: int = 0
     events: list[str] = field(default_factory=list)
+    request_fingerprints: dict[str, int] = field(default_factory=dict)
 
     def record_onshape_read(self) -> None:
         self.onshape_reads += 1
         self.events.append("onshape:get_features")
 
-    def record_cache_read(self) -> None:
+    def record_cache_read(self, fingerprint: str) -> bool:
+        repeat = fingerprint in self.request_fingerprints
+        self.request_fingerprints[fingerprint] = self.request_fingerprints.get(fingerprint, 0) + 1
         self.cache_reads += 1
-        self.events.append("cache:get_features")
+        self.events.append(f"cache:{fingerprint}")
+        return repeat
 
     def summary(self) -> dict[str, int]:
         return {"onshape_reads": self.onshape_reads, "cache_reads": self.cache_reads}
@@ -42,6 +63,7 @@ class StoredContext:
         default_factory=lambda: {"state": "empty", "feature_count": 0}
     )
     ledger: ReadLedger = field(default_factory=ReadLedger)
+    feature_index: Any = None
 
 
 class ContextStore:
@@ -82,14 +104,99 @@ class ContextStore:
         record.cache_metadata = {
             "state": "ready",
             "feature_count": len(_features(raw_features)),
+            "index_state": "empty",
+            "index_builds": 0,
         }
+        record.feature_index = None
         return record
 
     def record_onshape_read(self, context_handle: str) -> None:
         self.get(context_handle).ledger.record_onshape_read()
 
-    def record_cache_read(self, context_handle: str) -> None:
-        self.get(context_handle).ledger.record_cache_read()
+    def get_feature_index(self, context_handle: str) -> tuple[Any, bool]:
+        """Build the normalized index once per context and report whether it was a hit."""
+
+        record = self.get(context_handle)
+        if record.feature_index is not None:
+            return record.feature_index, True
+        from .features import FeatureIndex
+
+        record.feature_index = FeatureIndex.build(record.raw_features)
+        record.cache_metadata["index_state"] = "ready"
+        record.cache_metadata["index_builds"] = 1
+        return record.feature_index, False
+
+    def begin_operation(self, context_handle: str, *, exploratory_read: bool = False) -> None:
+        """Enforce call/read/consecutive gates before a governance tool proceeds."""
+
+        record = self.get(context_handle)
+        budget = record.working_state.budget
+        if budget.calls_used >= self.policy.max_calls_per_cycle:
+            raise GovernanceBudgetError(
+                "CALL_BUDGET_EXHAUSTED",
+                "The model-context tool-call budget is exhausted",
+            )
+        if exploratory_read:
+            if budget.exploratory_reads_used >= self.policy.max_exploratory_reads_per_cycle:
+                raise GovernanceBudgetError(
+                    "READ_BUDGET_EXHAUSTED",
+                    "The model-context exploratory read budget is exhausted",
+                )
+            if budget.consecutive_reads >= self.policy.max_consecutive_reads:
+                raise GovernanceBudgetError(
+                    "HYPOTHESIS_REQUIRED",
+                    "Update non-empty focus plus an open hypothesis or concrete next action "
+                    "before another exploratory read",
+                )
+        budget.record_call(exploratory_read=exploratory_read)
+
+    def record_cache_read(
+        self,
+        context_handle: str,
+        *,
+        tool_name: str = "get_features",
+        scope: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        fingerprint = _request_fingerprint(tool_name, scope or {})
+        return self.get(context_handle).ledger.record_cache_read(fingerprint)
+
+    def update_working_state(
+        self, context_handle: str, arguments: dict[str, Any]
+    ) -> tuple[StoredContext, bool]:
+        allowed = {
+            "contextHandle",
+            "focusFeatureIds",
+            "hypotheses",
+            "evidenceRefs",
+            "nextAction",
+            "phase",
+        }
+        forbidden = sorted(set(arguments) - allowed)
+        if forbidden:
+            raise WorkingStateFieldForbiddenError(forbidden)
+        record = self.get(context_handle)
+        meaningful = record.working_state.apply_operational_update(arguments)
+        return record, meaningful
+
+    @staticmethod
+    def cache_projection(
+        record: StoredContext,
+        *,
+        index_hit: Optional[bool] = None,
+        cache_repeat: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        projection = dict(record.cache_metadata)
+        if index_hit is not None:
+            projection["index_hit"] = index_hit
+        if cache_repeat is not None:
+            projection["cache_repeat"] = cache_repeat
+        return projection
+
+
+def _request_fingerprint(tool_name: str, scope: dict[str, Any]) -> str:
+    serialized = json.dumps(scope, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(f"{tool_name}:{serialized}".encode("utf-8")).hexdigest()[:16]
+    return f"{tool_name}:{digest}"
 
 
 def _features(raw_features: Any) -> list[dict[str, Any]]:
