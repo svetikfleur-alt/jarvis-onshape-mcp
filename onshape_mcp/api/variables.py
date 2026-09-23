@@ -58,9 +58,7 @@ class VariableManager:
         response = await self.client.post(path, data={"name": name})
         vs_id = response.get("id")
         if not vs_id:
-            raise RuntimeError(
-                f"Variable Studio creation returned no id: {response!r}"
-            )
+            raise RuntimeError("Variable Studio creation returned no id")
         return vs_id
 
     async def get_variables(

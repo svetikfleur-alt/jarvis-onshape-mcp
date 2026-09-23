@@ -6,6 +6,21 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel
 from loguru import logger
 
+from .request_guard import safe_http_diagnostic
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """Raise an HTTPX status error whose text cannot disclose raw URL details."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        diagnostic = safe_http_diagnostic(error)
+        raise httpx.HTTPStatusError(
+            f"Onshape API request failed: {diagnostic}",
+            request=error.request,
+            response=error.response,
+        ) from None
+
 
 class OnshapeCredentials(BaseModel):
     """Onshape API credentials."""
@@ -23,7 +38,9 @@ class OnshapeClient:
             result = await client.get("/api/v9/documents")
     """
 
-    def __init__(self, credentials: OnshapeCredentials):
+    def __init__(
+        self, credentials: OnshapeCredentials, *, transport: Optional[httpx.AsyncBaseTransport] = None
+    ):
         """Initialize the Onshape client.
 
         Args:
@@ -31,12 +48,13 @@ class OnshapeClient:
         """
         self.credentials = credentials
         self.base_url = credentials.base_url
+        self._transport = transport
         self._client: Optional[httpx.AsyncClient] = None
         self._own_client = False
 
     async def __aenter__(self):
         """Async context manager entry."""
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=30.0, transport=self._transport)
         self._own_client = True
         return self
 
@@ -49,7 +67,7 @@ class OnshapeClient:
         """Ensure HTTP client is initialized."""
         if self._client is None:
             # Create client if not using context manager (backwards compatibility)
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=30.0, transport=self._transport)
             self._own_client = True
 
     def _get_auth_header(self) -> str:
@@ -61,38 +79,6 @@ class OnshapeClient:
         auth_string = f"{self.credentials.access_key}:{self.credentials.secret_key}"
         encoded = base64.b64encode(auth_string.encode()).decode()
         return f"Basic {encoded}"
-
-    def _sanitize_for_logging(self, data: Any, max_length: int = 200) -> str:
-        """Sanitize sensitive data for logging.
-
-        Args:
-            data: Data to sanitize
-            max_length: Maximum length of output string
-
-        Returns:
-            Sanitized string safe for logging
-        """
-        if isinstance(data, dict):
-            sanitized = {}
-            for k, v in data.items():
-                if k.lower() in {
-                    "authorization",
-                    "api_key",
-                    "secret",
-                    "password",
-                    "token",
-                    "access_key",
-                    "secret_key",
-                }:
-                    sanitized[k] = "***REDACTED***"
-                else:
-                    sanitized[k] = v
-            return str(sanitized)[:max_length]
-
-        result = str(data)
-        if len(result) > max_length:
-            return result[:max_length] + "... (truncated)"
-        return result
 
     async def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Make a GET request to Onshape API.
@@ -111,11 +97,10 @@ class OnshapeClient:
         }
 
         self._ensure_client()
-        logger.debug(f"GET {url} with params: {self._sanitize_for_logging(params)}")
         response = await self._client.get(url, params=params, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
         result = response.json()
-        logger.debug(f"GET {url} response: {self._sanitize_for_logging(result, max_length=500)}")
+        logger.debug("Onshape GET request completed with status {}", response.status_code)
         return result
 
     async def get_raw(
@@ -144,12 +129,11 @@ class OnshapeClient:
         }
 
         self._ensure_client()
-        logger.debug(f"GET (raw) {url} with params: {self._sanitize_for_logging(params)}")
         response = await self._client.get(
             url, params=params, headers=headers, follow_redirects=follow_redirects
         )
-        response.raise_for_status()
-        logger.debug(f"GET (raw) {url} returned {len(response.content)} bytes")
+        _raise_for_status(response)
+        logger.debug("Onshape raw GET request completed with status {}", response.status_code)
         return response.content
 
     async def post(
@@ -176,28 +160,18 @@ class OnshapeClient:
         }
 
         self._ensure_client()
-        logger.debug(f"POST {url} with params: {self._sanitize_for_logging(params)}")
-        logger.debug(f"POST {url} data: {self._sanitize_for_logging(data, max_length=1000)}")
         response = await self._client.post(url, json=data, params=params, headers=headers)
 
         # Log error details if request failed
         if response.status_code >= 400:
-            try:
-                error_body = response.json()
-                logger.error(
-                    f"POST {url} failed with status {response.status_code}: {self._sanitize_for_logging(error_body)}"
-                )
-            except Exception:
-                logger.error(
-                    f"POST {url} failed with status {response.status_code}: {response.text[:500]}"
-                )
+            logger.error("Onshape POST request failed with status {}", response.status_code)
 
-        response.raise_for_status()
+        _raise_for_status(response)
         if not response.content:
-            logger.debug(f"POST {url} returned empty body (status {response.status_code})")
+            logger.debug("Onshape POST request completed with status {}", response.status_code)
             return {}
         result = response.json()
-        logger.debug(f"POST {url} response: {self._sanitize_for_logging(result, max_length=500)}")
+        logger.debug("Onshape POST request completed with status {}", response.status_code)
         return result
 
     async def delete(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -218,7 +192,7 @@ class OnshapeClient:
 
         self._ensure_client()
         response = await self._client.delete(url, params=params, headers=headers)
-        response.raise_for_status()
+        _raise_for_status(response)
         if not response.content:
             return {}
         return response.json()

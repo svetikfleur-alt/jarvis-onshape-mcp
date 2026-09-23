@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .client import OnshapeClient
+from .request_guard import safe_exception_message
 
 
 # File extensions by Onshape format name. Used when the translation response
@@ -255,13 +256,14 @@ class ExportManager:
         try:
             data = await self.download_external_data(result_doc_id, external_id)
         except Exception as e:  # noqa: BLE001
-            logger.exception("External data download failed")
+            message = safe_exception_message(e)
+            logger.error("External data download failed: {}", message)
             return TranslationResult(
                 ok=False,
                 state=state,
                 translation_id=translation_id,
                 format_name=fmt,
-                error_message=f"Download of external data failed: {e}",
+                error_message=f"Download of external data failed: {message}",
                 raw=status,
             )
 

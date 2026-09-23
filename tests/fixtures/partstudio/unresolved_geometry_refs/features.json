@@ -1,0 +1,101 @@
+{
+  "serializationVersion": "1.2.3",
+  "sourceMicroversion": "synthetic-microversion-002",
+  "features": [
+    {
+      "btType": "BTMSketch-151",
+      "featureId": "sketch-1",
+      "featureType": "newSketch",
+      "name": "Base Profile",
+      "suppressed": false,
+      "parameters": [
+        {
+          "btType": "BTMParameterQuantity-147",
+          "parameterId": "width",
+          "expression": "25 mm",
+          "value": 0.025,
+          "units": "m"
+        },
+        {
+          "btType": "BTMParameterUnknown-999",
+          "parameterId": "private-sketch-extension",
+          "unsupportedRaw": {
+            "poisonCanary": "RAW_POISON_UNRESOLVED_SKETCH_1A6B"
+          }
+        }
+      ]
+    },
+    {
+      "btType": "BTMFeature-134",
+      "featureId": "extrude-1",
+      "featureType": "extrude",
+      "name": "Main Extrude",
+      "suppressed": false,
+      "parameters": [
+        {
+          "btType": "BTMParameterQueryList-148",
+          "parameterId": "entities",
+          "queries": [
+            {
+              "btType": "BTMIndividualSketchRegionQuery-140",
+              "featureId": "sketch-1",
+              "deterministicIds": ["SYNTHETIC_REGION_002"]
+            }
+          ]
+        },
+        {
+          "btType": "BTMParameterUnknown-999",
+          "parameterId": "private-extrude-extension",
+          "unsupportedRaw": {
+            "poisonCanary": "RAW_POISON_UNRESOLVED_EXTRUDE_3C8D"
+          }
+        }
+      ]
+    },
+    {
+      "btType": "BTMFeature-134",
+      "featureId": "fillet-1",
+      "featureType": "fillet",
+      "name": "Edge Finish",
+      "suppressed": false,
+      "parameters": [
+        {
+          "btType": "BTMParameterQueryList-148",
+          "parameterId": "entities",
+          "queries": [
+            {
+              "btType": "BTMIndividualQuery-138",
+              "deterministicIds": ["SYNTHETIC_EDGE_003"]
+            }
+          ]
+        },
+        {
+          "btType": "BTMParameterUnknown-999",
+          "parameterId": "private-fillet-extension",
+          "unsupportedRaw": {
+            "poisonCanary": "RAW_POISON_UNRESOLVED_FILLET_5E0F"
+          }
+        }
+      ]
+    }
+  ],
+  "featureStates": {
+    "sketch-1": {
+      "featureStatus": "OK",
+      "messages": []
+    },
+    "extrude-1": {
+      "featureStatus": "OK",
+      "messages": []
+    },
+    "fillet-1": {
+      "featureStatus": "WARNING",
+      "messages": [
+        {
+          "severity": "WARNING",
+          "message": "Synthetic unresolved edge reference"
+        }
+      ]
+    }
+  }
+}

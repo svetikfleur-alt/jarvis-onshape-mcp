@@ -8,6 +8,17 @@ import httpx
 from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
 
 
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    """Transport double exercising the public HTTPX transport interface."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def handle_async_request(self, request):
+        self.calls += 1
+        return httpx.Response(200, request=request, json={"source": "injected"})
+
+
 class TestOnshapeCredentials:
     """Test OnshapeCredentials model."""
 
@@ -50,6 +61,90 @@ class TestOnshapeClient:
         # Client starts as None and is initialized on first use or context manager entry
         assert client._client is None
         assert client._own_client is False
+
+    @pytest.mark.asyncio
+    async def test_injected_transport_is_used_for_lazy_client_construction(self, mock_credentials):
+        """An injected transport must receive requests when the client is lazily created."""
+        transport = _RecordingTransport()
+        client = OnshapeClient(mock_credentials, transport=transport)
+
+        result = await client.get("/api/v9/documents")
+        await client.close()
+
+        assert result == {"source": "injected"}
+        assert transport.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_injected_transport_is_used_by_context_manager(self, mock_credentials):
+        """Context-manager construction must preserve the injected transport."""
+        transport = _RecordingTransport()
+
+        async with OnshapeClient(mock_credentials, transport=transport) as client:
+            result = await client.get("/api/v9/documents")
+
+        assert result == {"source": "injected"}
+        assert transport.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_post_error_logs_status_without_request_or_response_contents(
+        self, mock_credentials, monkeypatch
+    ):
+        """Changing diagnostics to log raw request/response data must be caught."""
+        events = []
+
+        class Logger:
+            def debug(self, *args):
+                events.append(args)
+
+            def error(self, *args):
+                events.append(args)
+
+        class ErrorTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(
+                    400,
+                    request=request,
+                    json={"error": "response-canary", "id": "private-id"},
+                )
+
+        monkeypatch.setattr("onshape_mcp.api.client.logger", Logger())
+        client = OnshapeClient(mock_credentials, transport=ErrorTransport())
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.post(
+                "/api/v9/documents/d/private-id",
+                data={"payload": "body-canary"},
+                params={"query": "query-canary"},
+            )
+        await client.close()
+
+        diagnostics = str(events)
+        assert "private-id" not in diagnostics
+        assert "body-canary" not in diagnostics
+        assert "query-canary" not in diagnostics
+        assert "response-canary" not in diagnostics
+
+    @pytest.mark.asyncio
+    async def test_http_status_exception_omits_raw_url_and_query_canaries(self, mock_credentials):
+        """HTTP status failures must retain status information without leaking URLs."""
+
+        class ErrorTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(404, request=request, json={"error": "response-canary"})
+
+        client = OnshapeClient(mock_credentials, transport=ErrorTransport())
+
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await client.get(
+                "/api/v9/documents/d/private-path-canary",
+                params={"secret": "private-query-canary"},
+            )
+        await client.close()
+
+        message = str(caught.value)
+        assert "404" in message
+        assert "private-path-canary" not in message
+        assert "private-query-canary" not in message
 
     def test_get_auth_header_encoding(self, mock_credentials):
         """Test Basic Auth header generation."""

@@ -50,6 +50,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 from .export import ExportManager, TranslationResult
 
@@ -143,9 +145,7 @@ class DrawingSectionManager:
         resp = await self.client.post(path, data=body)
         drawing_eid = resp.get("id")
         if not drawing_eid:
-            raise RuntimeError(
-                f"drawing create returned no element id: {resp!r}"
-            )
+            raise RuntimeError("drawing create returned no element id")
         return drawing_eid
 
     async def delete_drawing(
@@ -164,7 +164,7 @@ class DrawingSectionManager:
         try:
             await self.client.delete(path)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"delete_drawing({drawing_element_id}) failed: {e}")
+            logger.warning("delete_drawing failed: {}", safe_exception_message(e))
 
     # ---- Modify + poll ---------------------------------------------------
 
@@ -186,7 +186,7 @@ class DrawingSectionManager:
         resp = await self.client.post(path, data=body)
         mrid = resp.get("id")
         if not mrid:
-            raise RuntimeError(f"/modify returned no request id: {resp!r}")
+            raise RuntimeError("/modify returned no request id")
         return mrid
 
     async def _poll_modify(
@@ -305,14 +305,14 @@ class DrawingSectionManager:
         )
         result = await self._poll_modify(mrid)
         if not result.ok or not result.results:
-            err = (
-                result.results[0].error_message
-                if result.results
-                else f"modify request ended in state {result.request_state}"
+            safe_state = (
+                result.request_state
+                if result.request_state in {"ACTIVE", "DONE", "FAILED", "UNKNOWN"}
+                else "UNKNOWN"
             )
             raise RuntimeError(
-                f"TopLevel view creation failed: {err} "
-                f"(request_id={result.request_id})"
+                "TopLevel view creation failed: "
+                f"state={safe_state}; output_status_code={result.output_status_code}"
             )
         return result.results[0]
 

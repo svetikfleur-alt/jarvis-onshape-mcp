@@ -43,6 +43,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .request_guard import safe_exception_message
+
 from .client import OnshapeClient
 from .feature_apply import FeatureApplyResult, apply_feature_and_check
 from .fs_notices import extract_fs_body, fetch_body_notices, format_notices
@@ -83,9 +85,8 @@ class CustomFeatureManager:
             f"/api/v9/documents/d/{_ONSHAPE_STD_DID}/versions"
         )
         if not isinstance(versions, list) or not versions:
-            raise RuntimeError(
-                f"std versions returned unexpected shape: {versions!r}"
-            )
+            response_type = type(versions).__name__
+            raise RuntimeError(f"std versions returned unexpected shape: type={response_type}")
         # First entry is typically the "Start" placeholder; skip it. Last
         # entry has the most recent "<n>.0" name.
         for entry in reversed(versions):
@@ -96,7 +97,7 @@ class CustomFeatureManager:
                 if left.isdigit():
                     return left
         raise RuntimeError(
-            f"could not parse FS version from std versions list: {versions!r}"
+            f"could not parse FS version from std versions list: entry_count={len(versions)}"
         )
 
     # ---- Feature Studio element lifecycle ---------------------------------
@@ -112,9 +113,7 @@ class CustomFeatureManager:
         response = await self.client.post(path, data={"name": name})
         element_id = response.get("id")
         if not element_id:
-            raise RuntimeError(
-                f"Feature Studio creation returned no id: {response!r}"
-            )
+            raise RuntimeError("Feature Studio creation returned no id")
         return element_id
 
     async def upload_fs_source(
@@ -205,10 +204,9 @@ class CustomFeatureManager:
         }
 
         logger.debug(
-            "instantiate_custom_feature featureType={} namespace={!r} "
+            "instantiate_custom_feature featureType={} namespace_configured=true "
             "param_count={}",
             feature_type,
-            namespace,
             len(onshape_params),
         )
 
@@ -261,12 +259,9 @@ class CustomFeatureManager:
         feature_specs = specs.get("featureSpecs") or []
         if not feature_specs:
             raise RuntimeError(
-                f"Feature Studio {fs_eid} compiled to an empty feature spec. "
-                f"Likely causes: stale FeatureScript prelude version (try "
-                f"discover_fs_version() and confirm DEFAULT_FS_VERSION={DEFAULT_FS_VERSION!r} "
-                f"is current), or a syntax error. libraryVersion="
-                f"{specs.get('libraryVersion')!r}. Uploaded source preview: "
-                f"{feature_script[:200]!r}"
+                "Feature Studio compiled to an empty feature spec. Likely causes: "
+                "a stale FeatureScript prelude version or a syntax error. "
+                "Use discover_fs_version() and inspect the source locally."
             )
         # Pick the spec whose exported `featureType` matches the caller's,
         # else fall back to the first. BTFeatureSpec-129 keys live at the
@@ -283,10 +278,18 @@ class CustomFeatureManager:
             or upload_resp.get("microversionId")
         )
         if not source_microversion:
+            safe_spec_fields = sorted(
+                {"displayName", "featureType", "sourceMicroversionId"}
+                & target_spec.keys()
+            )
+            safe_upload_fields = sorted(
+                {"microversionId", "sourceMicroversion"} & upload_resp.keys()
+            )
             raise RuntimeError(
-                f"Could not extract sourceMicroversionId from featurespecs. "
-                f"Spec entry keys: {list(msg.keys())}; upload_resp keys: "
-                f"{list(upload_resp.keys())}"
+                "Could not extract sourceMicroversionId from featurespecs; "
+                f"safe_spec_fields={safe_spec_fields}; "
+                f"safe_upload_fields={safe_upload_fields}; "
+                f"spec_field_count={len(target_spec)}; upload_field_count={len(upload_resp)}"
             )
 
         apply_result = await self.instantiate_custom_feature(
@@ -326,7 +329,9 @@ class CustomFeatureManager:
                             f"{base}\nFS NOTICES:\n{rendered}".lstrip()
                         )
             except Exception as e:  # noqa: BLE001
-                logger.debug(f"FS body re-eval enrichment failed: {e}")
+                logger.debug(
+                    "FS body re-eval enrichment failed: {}", safe_exception_message(e)
+                )
 
         return {
             "apply_result": apply_result,

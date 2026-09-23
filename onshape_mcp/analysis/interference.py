@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from ..api.request_guard import safe_exception_message
+
 METERS_TO_INCHES = 1.0 / 0.0254
 
 
@@ -201,7 +203,7 @@ async def check_assembly_interference(
                 )
                 bbox_cache[cache_key] = BoundingBox.from_api_response(bbox_data)
             except Exception as e:
-                logger.warning(f"Could not get bbox for part {inst_part_id}: {e}")
+                logger.warning("Could not get bbox for part: {}", safe_exception_message(e))
 
     # Compute world-space AABBs
     identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
