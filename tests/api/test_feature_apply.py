@@ -34,13 +34,45 @@ class TestApplyAssemblyFeatureAndCheck:
             onshape_client, "docA", "wsA", "asmA", {"feature": {}},
         )
         assert isinstance(result, FeatureApplyResult)
-        assert result.ok is True
         assert result.status == "OK"
         assert result.feature_id == "f1"
         assert result.feature_type == "mateConnector"
         # Path targets the assemblies endpoint.
         posted_path = onshape_client.post.await_args[0][0]
         assert "/api/v9/assemblies/d/docA/w/wsA/e/asmA/features" in posted_path
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["OK", "INFO"])
+    async def test_response_status_does_not_verify_requested_assembly_state(
+        self, onshape_client, status
+    ):
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {
+                    "featureId": "f1",
+                    "name": "MC",
+                    "featureType": "mateConnector",
+                },
+                "featureState": {"featureStatus": status},
+            }
+        )
+        onshape_client.get = AsyncMock()
+
+        result = await apply_assembly_feature_and_check(
+            onshape_client,
+            "docA",
+            "wsA",
+            "asmA",
+            {"feature": {"name": "MC", "featureType": "mateConnector"}},
+        )
+
+        assert result.ok is False
+        assert result.regen_ok is True
+        assert result.mutation_verification == "unverified"
+        assert result.changed is None
+        assert result.verification_scope == "response_feature_state"
+        assert result.reason_code == "REQUESTED_STATE_UNVERIFIED"
+        onshape_client.get.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_error_status_surfaces_as_ok_false(self, onshape_client):
@@ -57,7 +89,25 @@ class TestApplyAssemblyFeatureAndCheck:
         )
         assert result.ok is False
         assert result.status == "ERROR"
+        assert result.regen_ok is False
+        assert result.mutation_verification == "failed"
         assert "over-constrained" in (result.error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_missing_assembly_status_is_unverified(self, onshape_client):
+        onshape_client.post = AsyncMock(
+            return_value={"feature": {"featureId": "unknown"}}
+        )
+        onshape_client.get = AsyncMock(return_value={"featureStates": {}})
+
+        result = await apply_assembly_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": {"name": "Requested"}}
+        )
+
+        assert result.ok is False
+        assert result.regen_ok is None
+        assert result.mutation_verification == "unverified"
+        assert result.reason_code == "FEATURE_STATUS_UNAVAILABLE"
 
     @pytest.mark.asyncio
     async def test_update_operation_uses_featureid_path(self, onshape_client):
@@ -248,6 +298,44 @@ async def test_update_raises_for_unknown_parameter(onshape_client):
 
 
 @pytest.mark.asyncio
+async def test_assign_variable_rejects_value_slot_before_post(onshape_client):
+    """Issue #6: LENGTH assignVariable uses its current feature-defined slot."""
+    assign_variable = {
+        "btType": "BTMFeature-134",
+        "featureId": "variable-feature",
+        "featureType": "assignVariable",
+        "name": "Variable 1",
+        "parameters": [
+            {
+                "btType": "BTMParameterString-149",
+                "parameterId": "variableName",
+                "value": "length",
+            },
+            {
+                "btType": "BTMParameterQuantity-147",
+                "parameterId": "lengthValue",
+                "expression": "10 mm",
+                "value": 0.01,
+            },
+        ],
+    }
+    onshape_client.get = AsyncMock(return_value={"features": [assign_variable]})
+    onshape_client.post = AsyncMock()
+
+    with pytest.raises(ValueError, match="parameterId.*value"):
+        await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "variable-feature",
+            [{"parameterId": "value", "expression": "15 mm"}],
+        )
+
+    onshape_client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_update_rejects_missing_fields(onshape_client):
     onshape_client.get = AsyncMock(return_value={"features": [_extrude_feature()]})
     onshape_client.post = AsyncMock()
@@ -291,6 +379,24 @@ async def test_update_reports_post_error_status(onshape_client):
 
 
 class TestPartStudioMutationTruth:
+    @pytest.mark.parametrize(
+        "verification", ["unverified", "no_effect", "failed"]
+    )
+    def test_public_projection_refuses_nonverified_ok_claim(self, verification):
+        result = FeatureApplyResult(
+            ok=True,
+            status="OK",
+            feature_id="unsafe",
+            feature_name="Unverified",
+            feature_type="extrude",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=True,
+            mutation_verification=verification,
+        )
+
+        assert result.public_dict()["ok"] is False
+
     @pytest.mark.asyncio
     async def test_create_requires_authoritative_reread_for_verified_success(
         self, onshape_client
@@ -409,6 +515,32 @@ class TestPartStudioMutationTruth:
         assert result.reason_code == "FEATURE_STATUS_UNAVAILABLE"
 
     @pytest.mark.asyncio
+    async def test_create_without_substantive_requested_fields_is_unverified(
+        self, onshape_client
+    ):
+        actual = _extrude_feature(feature_id="created")
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": actual,
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+        onshape_client.get = AsyncMock(
+            return_value={
+                "features": [actual],
+                "featureStates": {"created": {"featureStatus": "OK"}},
+            }
+        )
+
+        result = await apply_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": {}}
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "unverified"
+        assert result.reason_code == "REQUESTED_STATE_UNVERIFIED"
+
+    @pytest.mark.asyncio
     async def test_create_canonicalized_quantity_expression_is_unverified(
         self, onshape_client
     ):
@@ -501,6 +633,7 @@ class TestPartStudioMutationTruth:
         assert result.mutation_verification == "verified"
         assert result.changed is True
         assert result.verification_scope == "requested_parameters"
+        assert onshape_client.get.await_count == 2
 
     @pytest.mark.asyncio
     async def test_update_already_satisfied_is_no_effect_without_post(

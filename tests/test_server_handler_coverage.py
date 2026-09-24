@@ -50,6 +50,12 @@ def _apply_result(
         feature_name=feature_name,
         feature_type=feature_type,
         error_message=error_message,
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=status in {"OK", "INFO"},
+        mutation_verification="verified" if ok else "failed",
+        changed=True,
+        verification_scope="test_fixture",
         raw={},
     )
 
@@ -398,7 +404,7 @@ async def test_edit_sketch_returns_structured_change_bookkeeping(
 
     edit = AsyncMock(
         return_value=EditSketchResult(
-            apply=_apply_result(feature_id="sketch-safe", feature_name="Edited", status="WARNING"),
+            apply=_apply_result(feature_id="sketch-safe", feature_name="Edited"),
             added_entity_ids=["line-added"],
             added_constraint_ids=["horizontal-added"],
             removed_entity_ids=["line-removed"],
@@ -429,7 +435,7 @@ async def test_edit_sketch_returns_structured_change_bookkeeping(
     payload = _json_payload(await server.call_tool("edit_sketch", arguments))
 
     assert payload["ok"] is True
-    assert payload["status"] == "WARNING"
+    assert payload["status"] == "OK"
     assert payload["tool"] == "edit_sketch"
     assert payload["added_entity_ids"] == ["line-added"]
     assert payload["removed_constraint_ids"] == ["coincident-removed"]

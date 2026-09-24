@@ -1410,7 +1410,14 @@ class TestAssemblyTools:
         return FeatureApplyResult(
             ok=ok, status=status, feature_id=feature_id,
             feature_name=feature_name, feature_type=feature_type,
-            error_message=error_message, raw={},
+            error_message=error_message,
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=status in {"OK", "INFO"},
+            mutation_verification="verified" if ok else "failed",
+            changed=True,
+            verification_scope="test_fixture",
+            raw={},
         )
 
     # ---- create_fastened_mate -------------------------------------------
@@ -2334,7 +2341,11 @@ class TestUpdateFeature:
     @patch("onshape_mcp.server.update_feature_params_and_check")
     async def test_update_feature_value_error(self, mock_update):
         """feature_id not on element surfaces as EXCEPTION with clear message."""
-        mock_update.side_effect = ValueError("feature_id 'bogus' not found")
+        from onshape_mcp.api.feature_apply import MutationPreflightError
+
+        mock_update.side_effect = MutationPreflightError(
+            "feature_id 'bogus' not found"
+        )
         result = await call_tool("update_feature", {
             "documentId": "d", "workspaceId": "w", "elementId": "e",
             "featureId": "bogus",
@@ -2344,7 +2355,62 @@ class TestUpdateFeature:
         parsed = _json.loads(result[0].text)
         assert parsed["ok"] is False
         assert parsed["status"] == "EXCEPTION"
+        assert parsed["mutation_verification"] == "failed"
+        assert parsed["changed"] is False
         assert "not found" in (parsed["error_message"] or "")
+
+    @pytest.mark.asyncio
+    async def test_update_feature_post_parse_error_is_unverified(
+        self, onshape_client, mock_httpx_client, monkeypatch
+    ):
+        import json as _json
+        import onshape_mcp.server as server
+
+        current_feature = {
+            "featureId": "fId",
+            "featureType": "extrude",
+            "name": "Extrude",
+            "parameters": [
+                {
+                    "btType": "BTMParameterQuantity-147",
+                    "parameterId": "depth",
+                    "expression": "10 mm",
+                    "value": 0.01,
+                }
+            ],
+        }
+        get_response = Mock()
+        get_response.json.return_value = {"features": [current_feature]}
+        get_response.raise_for_status.return_value = None
+        get_response.status_code = 200
+        get_response.text = ""
+        post_response = Mock()
+        post_response.json.side_effect = _json.JSONDecodeError(
+            "invalid response", "not-json", 0
+        )
+        post_response.raise_for_status.return_value = None
+        post_response.status_code = 200
+        post_response.text = "not-json"
+        mock_httpx_client.get.return_value = get_response
+        mock_httpx_client.post.return_value = post_response
+        monkeypatch.setattr(server, "client", onshape_client)
+
+        result = await call_tool(
+            "update_feature",
+            {
+                "documentId": "d",
+                "workspaceId": "w",
+                "elementId": "e",
+                "featureId": "fId",
+                "updates": [{"parameterId": "depth", "expression": "15 mm"}],
+            },
+        )
+
+        parsed = _json.loads(result[0].text)
+        assert parsed["ok"] is False
+        assert parsed["mutation_verification"] == "unverified"
+        assert parsed["changed"] is None
+        mock_httpx_client.post.assert_awaited_once()
 
 
 class TestDeleteDocument:

@@ -28,6 +28,10 @@ FeatureStatus = Literal["OK", "INFO", "WARNING", "ERROR", "UNKNOWN"]
 MutationVerification = Literal["verified", "unverified", "no_effect", "failed"]
 
 
+class MutationPreflightError(ValueError):
+    """Mutation input was rejected before any delegated write."""
+
+
 class FeatureApplyResult(BaseModel):
     """Structured result of applying (create/update) a feature.
 
@@ -66,8 +70,15 @@ class FeatureApplyResult(BaseModel):
     def public_dict(self) -> Dict[str, Any]:
         """Bounded allowlisted representation safe for MCP mutation results."""
 
+        semantic_ok = (
+            self.ok
+            and self.transport_ok is True
+            and self.http_ok is True
+            and self.regen_ok is True
+            and self.mutation_verification == "verified"
+        )
         return {
-            "ok": self.ok,
+            "ok": semantic_ok,
             "status": self.status,
             "feature_id": self.feature_id,
             "feature_type": self.feature_type,
@@ -458,7 +469,10 @@ async def apply_feature_and_check(
 
     requested_feature = feature_payload.get("feature", feature_payload)
     comparison: Optional[bool] = None
-    if verify_requested_state and isinstance(requested_feature, dict):
+    has_comparable_request = isinstance(requested_feature, dict) and any(
+        key not in {"featureId", "nodeId"} for key in requested_feature
+    )
+    if verify_requested_state and has_comparable_request:
         comparison = _requested_subset_compare(requested_feature, actual_feature)
 
     if comparison is True:
@@ -539,12 +553,11 @@ async def apply_assembly_feature_and_check(
 ) -> FeatureApplyResult:
     """Apply a feature to an Assembly and return its Onshape-reported status.
 
-    Mirror of `apply_feature_and_check` that targets the assemblies endpoint
-    instead of partstudios. Mate connectors, mates (fastened / revolute /
-    slider / cylindrical), and any other assembly feature ride through this
-    helper so callers see `status=ERROR` when the solver rejects a mate,
-    instead of the silent "Created fastened mate 'foo'. Feature ID: bar"
-    prose the old path returned.
+    Assembly responses provide transport and regeneration evidence, but this
+    helper has no authoritative requested-field reread. Mate connectors, mates
+    (fastened / revolute / slider / cylindrical), and any other assembly
+    feature therefore remain ``unverified`` after an OK/INFO response and
+    surface ``failed`` when the solver reports a regeneration error.
 
     Response shape on the assembly side is identical to the PS side
     (`{featureState, feature, ...}`) — verified via live probe — so the
@@ -586,7 +599,13 @@ async def apply_assembly_feature_and_check(
             state = None
 
     status = _normalize_status((state or {}).get("featureStatus", "UNKNOWN"))
-    ok = status in ("OK", "INFO")
+    regen_ok: Optional[bool] = (
+        True
+        if _regen_ok(status)
+        else False
+        if status != "UNKNOWN"
+        else None
+    )
 
     error_message: Optional[str] = None
     if status != "OK":
@@ -599,8 +618,29 @@ async def apply_assembly_feature_and_check(
         )
         error_message = _extract_error_message(state or {}, fs_status=fs_status)
 
+    if regen_ok is False:
+        verification: MutationVerification = "failed"
+        reason_code = "FEATURE_REGENERATION_ERROR"
+        verification_message = (
+            "Onshape reported a non-success assembly regeneration status."
+        )
+    else:
+        verification = "unverified"
+        reason_code = (
+            "REQUESTED_STATE_UNVERIFIED"
+            if regen_ok is True
+            else "FEATURE_STATUS_UNAVAILABLE"
+        )
+        verification_message = (
+            "Assembly regeneration was accepted, but requested fields were not "
+            "verified by an authoritative reread."
+            if regen_ok is True
+            else "Assembly regeneration status and requested state could not be verified."
+        )
+        error_message = verification_message
+
     return FeatureApplyResult(
-        ok=ok,
+        ok=False,
         status=status,
         feature_id=real_feature_id,
         feature_name=feature_name,
@@ -608,13 +648,12 @@ async def apply_assembly_feature_and_check(
         error_message=error_message,
         transport_ok=True,
         http_ok=True,
-        regen_ok=ok,
-        mutation_verification="verified" if ok else "failed",
+        regen_ok=regen_ok,
+        mutation_verification=verification,
         changed=None,
         verification_scope="response_feature_state",
-        reason_code=(
-            "RESPONSE_FEATURE_STATE_OK" if ok else "FEATURE_REGENERATION_ERROR"
-        ),
+        reason_code=reason_code,
+        verification_message=verification_message,
         raw={"response": response if isinstance(response, dict) else {}},
     )
 
@@ -658,9 +697,9 @@ async def update_feature_params_and_check(
             programmer/driver errors, not API failures.
     """
     if not feature_id:
-        raise ValueError("feature_id is required")
+        raise MutationPreflightError("feature_id is required")
     if not updates:
-        raise ValueError("updates must be a non-empty list")
+        raise MutationPreflightError("updates must be a non-empty list")
 
     base = (
         f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/features"
@@ -674,7 +713,7 @@ async def update_feature_params_and_check(
             target = feat
             break
     if target is None:
-        raise ValueError(
+        raise MutationPreflightError(
             f"feature_id {feature_id!r} not found in element. "
             f"Available ids: {[f.get('featureId') for f in features]}"
         )
@@ -689,7 +728,7 @@ async def update_feature_params_and_check(
     missing: List[str] = []
     for upd in updates:
         if not isinstance(upd, dict) or "parameterId" not in upd:
-            raise ValueError(
+            raise MutationPreflightError(
                 f"each update must be a dict with a 'parameterId' key, got {upd!r}"
             )
         pid = upd["parameterId"]
@@ -714,7 +753,7 @@ async def update_feature_params_and_check(
 
     if missing:
         existing = sorted(param_by_id.keys())
-        raise ValueError(
+        raise MutationPreflightError(
             f"parameterId(s) not found on feature: {missing!r}. "
             f"Feature has parameters: {existing}"
         )

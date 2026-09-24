@@ -41,6 +41,7 @@ from .api.feature_apply import (
     delete_partstudio_feature_and_check,
     update_feature_params_and_check,
     FeatureApplyResult,
+    MutationPreflightError,
 )
 from .api.entities import EntityManager
 from .api.describe import DescribeManager
@@ -2925,6 +2926,7 @@ def _exception_json(
     tool_name: Optional[str] = None,
     status_code: Optional[int] = None,
     hints: Optional[list[str]] = None,
+    request_rejected: bool = False,
 ) -> str:
     """Serialize an unexpected exception as the same structured shape.
 
@@ -2933,8 +2935,9 @@ def _exception_json(
     distinguish an Onshape-reported failure ("ERROR") from a plumbing failure.
 
     Default hints point Claude at `describe_part_studio` to rediscover the
-    tree's current state. An exception alone cannot prove whether a mutating
-    request reached Onshape, so this projection remains unverified.
+    tree's current state. Explicit pre-write rejection and HTTP 4xx rejection
+    are ``failed``; transport, server, and otherwise ambiguous failures remain
+    ``unverified`` because the mutation's effect cannot be proven.
     """
     raw_diagnostic = getattr(error, "onshape_diagnostic", None)
     raw_diagnostic = raw_diagnostic if isinstance(raw_diagnostic, dict) else None
@@ -3027,6 +3030,14 @@ def _exception_json(
         transport_ok = None
         http_ok = None
         reason_code = reason_code or "LOCAL_MUTATION_REJECTED"
+    diagnostic_status_code = (
+        diagnostic.get("status_code") if diagnostic is not None else status_code
+    )
+    definitive_rejection = request_rejected or (
+        isinstance(error, httpx.HTTPStatusError)
+        and isinstance(diagnostic_status_code, int)
+        and 400 <= diagnostic_status_code < 500
+    )
     payload: dict[str, Any] = {
         "ok": False,
         "status": "EXCEPTION",
@@ -3037,8 +3048,10 @@ def _exception_json(
         "transport_ok": transport_ok,
         "http_ok": http_ok,
         "regen_ok": None,
-        "mutation_verification": "unverified",
-        "changed": None,
+        "mutation_verification": (
+            "failed" if definitive_rejection else "unverified"
+        ),
+        "changed": False if definitive_rejection else None,
         "verification_scope": "none",
         "failure_kind": failure_kind,
         "reason_code": reason_code,
@@ -4132,6 +4145,17 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 arguments["updates"],
             )
             return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
+        except MutationPreflightError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(
+                        e,
+                        tool_name=name,
+                        request_rejected=True,
+                    ),
+                )
+            ]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
