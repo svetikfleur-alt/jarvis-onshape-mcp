@@ -66,6 +66,8 @@ from .builders.fillet import FilletBuilder
 from .builders.chamfer import ChamferBuilder, ChamferType
 from .builders.shell import ShellBuilder
 from .builders.offset_plane import OffsetPlaneBuilder
+from .builders.draft import DraftBuilder
+from .builders.transform import TransformBuilder
 from .builders.revolve import RevolveBuilder, RevolveType
 from .builders.pattern import LinearPatternBuilder, CircularPatternBuilder
 from .builders.boolean import BooleanBuilder, BooleanType
@@ -137,6 +139,8 @@ list_entities, or from create_offset_plane).
 - create_fillet / create_chamfer
 - create_shell — hollow a body; pass faceIds to remove; inward by default (bbox preserved)
 - create_offset_plane — signed offset from a datum (Front/Top/Right) or a face; pass feature_id as faceId into any sketch primitive
+- create_draft — neutral-plane Draft only; selected faces, neutral plane, angle, and reversible pull direction
+- move_body — translation-only Part Studio Transform in world X/Y/Z; never copies bodies
 - create_boolean — union / subtract / intersect existing bodies
 - create_linear_pattern / create_circular_pattern
 - write_featurescript_feature — escape hatch: threads, helices, sweeps, lofts, anything not primitive. Takes a complete FS source file.
@@ -1835,6 +1839,134 @@ async def list_tools() -> list[Tool]:
                     "variableOffset": {"type": "string", "description": "Optional variable name for offset"},
                 },
                 "required": ["documentId", "workspaceId", "elementId", "offset"],
+            },
+        ),
+        Tool(
+            name="create_draft",
+            description=(
+                "Create a native neutral-plane Draft on selected faces. This tool "
+                "supports only the neutral-plane subset: selected draft faces, one "
+                "neutral plane or planar face, a positive angle below 89.9 degrees, "
+                "and optional reversed pull direction. Parting-line, tangent-"
+                "propagation, and re-fillet Draft variants are unsupported and "
+                "rejected before network access."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {
+                        "type": "string",
+                        "description": "Part Studio element ID",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Draft feature name",
+                        "default": "Draft",
+                    },
+                    "neutralPlaneId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "Deterministic ID of the planar face, datum plane, or mate "
+                            "connector defining the neutral plane and pull direction."
+                        ),
+                    },
+                    "faceIds": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "description": "Deterministic IDs of faces to draft.",
+                    },
+                    "angle": {
+                        "type": ["number", "string"],
+                        "description": (
+                            "Draft angle greater than 0 and less than 89.9 degrees. "
+                            "Bare numbers are degrees; explicit strings may use deg or rad."
+                        ),
+                    },
+                    "reversePullDirection": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Reverse the neutral plane's normal as pull direction.",
+                    },
+                    "trackChanges": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Include bounded before/after body change tracking.",
+                    },
+                },
+                "required": [
+                    "documentId",
+                    "workspaceId",
+                    "elementId",
+                    "neutralPlaneId",
+                    "faceIds",
+                    "angle",
+                ],
+            },
+        ),
+        Tool(
+            name="move_body",
+            description=(
+                "Move selected Part Studio bodies using the native translation-only "
+                "Transform subset in world X/Y/Z coordinates. makeCopy is always false. "
+                "Rotation, scale, copy, mate-connector transforms, entity-directed "
+                "translation, and other Transform modes are unsupported and rejected "
+                "before network access."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
+                    "elementId": {
+                        "type": "string",
+                        "description": "Part Studio element ID",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Transform feature name",
+                        "default": "Move body",
+                    },
+                    "bodyIds": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "description": "Deterministic IDs of bodies to translate.",
+                    },
+                    "translationX": {
+                        "type": ["number", "string"],
+                        "description": "World-X translation; bare numbers are millimeters.",
+                    },
+                    "translationY": {
+                        "type": ["number", "string"],
+                        "description": "World-Y translation; bare numbers are millimeters.",
+                    },
+                    "translationZ": {
+                        "type": ["number", "string"],
+                        "description": "World-Z translation; bare numbers are millimeters.",
+                    },
+                    "trackChanges": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Include bounded before/after body change tracking.",
+                    },
+                },
+                "required": [
+                    "documentId",
+                    "workspaceId",
+                    "elementId",
+                    "bodyIds",
+                    "translationX",
+                    "translationY",
+                    "translationZ",
+                ],
             },
         ),
         Tool(
@@ -5357,6 +5489,129 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
             _log_unexpected_error("Unexpected error creating offset plane", e)
+            return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
+
+    elif name == "create_draft":
+        try:
+            allowed = {
+                "documentId",
+                "workspaceId",
+                "elementId",
+                "name",
+                "neutralPlaneId",
+                "faceIds",
+                "angle",
+                "reversePullDirection",
+                "trackChanges",
+            }
+            unsupported = sorted(set(arguments) - allowed)
+            if unsupported:
+                raise ValueError(
+                    f"Unsupported create_draft argument(s): {unsupported}; "
+                    "only neutral-plane Draft is supported"
+                )
+            face_ids = arguments["faceIds"]
+            if not isinstance(face_ids, list):
+                raise ValueError("faceIds must be a non-empty list of face IDs")
+            reverse = arguments.get("reversePullDirection", False)
+            if not isinstance(reverse, bool):
+                raise ValueError("reversePullDirection must be a boolean")
+
+            draft = DraftBuilder(
+                name=arguments.get("name", "Draft"),
+                neutral_plane_id=arguments["neutralPlaneId"],
+                angle=arguments["angle"],
+                reverse_pull_direction=reverse,
+            )
+            for face_id in face_ids:
+                draft.add_face(face_id)
+            result = await apply_feature_and_check(
+                client,
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+                draft.build(),
+                track_changes=bool(arguments.get("trackChanges", True)),
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=_feature_apply_json(result, tool_name=name),
+                )
+            ]
+        except httpx.HTTPStatusError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(
+                        e,
+                        tool_name=name,
+                        status_code=e.response.status_code,
+                    ),
+                )
+            ]
+        except Exception as e:
+            _log_unexpected_error("Unexpected error creating draft", e)
+            return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
+
+    elif name == "move_body":
+        try:
+            allowed = {
+                "documentId",
+                "workspaceId",
+                "elementId",
+                "name",
+                "bodyIds",
+                "translationX",
+                "translationY",
+                "translationZ",
+                "trackChanges",
+            }
+            unsupported = sorted(set(arguments) - allowed)
+            if unsupported:
+                raise ValueError(
+                    f"Unsupported move_body argument(s): {unsupported}; "
+                    "only world-coordinate translation is supported"
+                )
+            body_ids = arguments["bodyIds"]
+            if not isinstance(body_ids, list):
+                raise ValueError("bodyIds must be a non-empty list of body IDs")
+
+            transform = TransformBuilder(
+                name=arguments.get("name", "Move body"),
+                translation_x=arguments["translationX"],
+                translation_y=arguments["translationY"],
+                translation_z=arguments["translationZ"],
+            )
+            for body_id in body_ids:
+                transform.add_body(body_id)
+            result = await apply_feature_and_check(
+                client,
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+                transform.build(),
+                track_changes=bool(arguments.get("trackChanges", True)),
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=_feature_apply_json(result, tool_name=name),
+                )
+            ]
+        except httpx.HTTPStatusError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(
+                        e,
+                        tool_name=name,
+                        status_code=e.response.status_code,
+                    ),
+                )
+            ]
+        except Exception as e:
+            _log_unexpected_error("Unexpected error moving bodies", e)
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
 
     elif name == "create_revolve":
