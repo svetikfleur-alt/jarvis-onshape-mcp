@@ -69,13 +69,23 @@ class TestChamferBuilder:
         assert feature["name"] == "TestChamfer"
 
     def test_build_chamfer_type_parameter(self):
-        for ct in ChamferType:
-            chamfer = ChamferBuilder(chamfer_type=ct)
-            chamfer.add_edge("edge1")
-            result = chamfer.build()
-            params = result["feature"]["parameters"]
-            type_param = next(p for p in params if p["parameterId"] == "chamferType")
-            assert type_param["value"] == ct.value
+        chamfer = ChamferBuilder(chamfer_type=ChamferType.EQUAL_OFFSETS)
+        chamfer.add_edge("edge1")
+        result = chamfer.build()
+        params = result["feature"]["parameters"]
+        type_param = next(p for p in params if p["parameterId"] == "chamferType")
+        assert type_param["value"] == ChamferType.EQUAL_OFFSETS.value
+
+    @pytest.mark.parametrize(
+        "chamfer_type",
+        [ChamferType.TWO_OFFSETS, ChamferType.OFFSET_ANGLE],
+    )
+    def test_build_rejects_modes_without_required_parameters(self, chamfer_type):
+        """Do not emit a malformed one-width payload for richer chamfer modes."""
+        chamfer = ChamferBuilder(chamfer_type=chamfer_type).add_edge("edge1")
+
+        with pytest.raises(ValueError, match="supports only EQUAL_OFFSETS"):
+            chamfer.build()
 
     def test_build_distance_without_variable(self):
         """Bare numbers default to mm; value is meters."""

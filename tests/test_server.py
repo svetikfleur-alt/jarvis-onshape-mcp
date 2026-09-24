@@ -2025,6 +2025,23 @@ class TestFeatureTools:
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.apply_feature_and_check")
+    async def test_create_chamfer_rejects_unsupported_mode_before_transport(
+        self, mock_apply
+    ):
+        result = await call_tool("create_chamfer", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "distance": 0.1, "edgeIds": ["edge1"],
+            "chamferType": "TWO_OFFSETS",
+        })
+
+        import json as _json
+        parsed = _json.loads(result[0].text)
+        assert parsed["ok"] is False
+        assert "supports only EQUAL_OFFSETS" in parsed["error_message"]
+        mock_apply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
     async def test_create_revolve_rejects_unresolved_axis_payload_before_transport(
         self, mock_apply
     ):
@@ -2072,11 +2089,48 @@ class TestFeatureTools:
         )
         result = await call_tool("create_circular_pattern", {
             "documentId": "d", "workspaceId": "w", "elementId": "e",
-            "count": 6, "featureIds": ["f1"],
+            "count": 6, "featureIds": ["f1"], "axisEntityId": "axis-1",
         })
         import json as _json
         parsed = _json.loads(result[0].text)
         assert parsed["ok"] is True and parsed["feature_id"] == "cp123"
+        parameters = {
+            parameter["parameterId"]: parameter
+            for parameter in mock_apply.await_args.args[4]["feature"]["parameters"]
+        }
+        assert parameters["instanceFunction"]["featureIds"] == ["f1"]
+        assert parameters["axis"]["queries"][0]["deterministicIds"] == ["axis-1"]
+        assert parameters["equalSpace"]["value"] is True
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
+    async def test_create_circular_pattern_requires_axis_before_transport(self, mock_apply):
+        result = await call_tool("create_circular_pattern", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "count": 6, "featureIds": ["f1"],
+        })
+
+        import json as _json
+        parsed = _json.loads(result[0].text)
+        assert parsed["ok"] is False
+        assert "axis_entity_id" in parsed["error_message"]
+        mock_apply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.apply_feature_and_check")
+    async def test_create_circular_pattern_rejects_blank_axis_before_transport(
+        self, mock_apply
+    ):
+        result = await call_tool("create_circular_pattern", {
+            "documentId": "d", "workspaceId": "w", "elementId": "e",
+            "count": 6, "featureIds": ["f1"], "axisEntityId": "   ",
+        })
+
+        import json as _json
+        parsed = _json.loads(result[0].text)
+        assert parsed["ok"] is False
+        assert "non-blank string" in parsed["error_message"]
+        mock_apply.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.apply_feature_and_check")

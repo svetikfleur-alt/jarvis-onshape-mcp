@@ -78,6 +78,12 @@ class ChamferBuilder:
         """
         if not self.edge_queries:
             raise ValueError("At least one edge must be added")
+        if self.chamfer_type is not ChamferType.EQUAL_OFFSETS:
+            raise ValueError(
+                "ChamferBuilder currently supports only EQUAL_OFFSETS; "
+                f"{self.chamfer_type.value} requires additional current-Onshape "
+                "parameters that this builder does not accept."
+            )
 
         if self.distance_variable:
             distance_expression = f"#{self.distance_variable}"

@@ -31,7 +31,9 @@ def _affected_payloads() -> list[dict]:
     linear = LinearPatternBuilder(direction_edge_id="edge-direction").add_feature(
         "feature-linear"
     )
-    circular = CircularPatternBuilder().add_feature("feature-circular")
+    circular = CircularPatternBuilder(axis_entity_id="axis-circular").add_feature(
+        "feature-circular"
+    )
     boolean = BooleanBuilder().add_tool_body("body-tool")
     return [
         ExtrudeBuilder(sketch_feature_id="sketch-extrude").build(),
