@@ -1,8 +1,9 @@
 """Onshape API client for REST API communication."""
 
 import base64
+import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -88,12 +89,33 @@ class OnshapeHTTPError(httpx.HTTPStatusError):
         self.onshape_diagnostic = diagnostic
 
 
+class OnshapeCredentialError(ValueError):
+    """Runtime credentials are absent before an Onshape request."""
+
+
 class OnshapeCredentials(BaseModel):
     """Onshape API credentials."""
 
     access_key: str
     secret_key: str
     base_url: str = "https://cad.onshape.com"
+
+
+def resolve_onshape_credentials(
+    environment: Optional[Mapping[str, str]] = None,
+) -> OnshapeCredentials:
+    """Resolve one complete supported credential pair without cross-pair mixing."""
+
+    source = os.environ if environment is None else environment
+    for access_name, secret_name in (
+        ("ONSHAPE_ACCESS_KEY", "ONSHAPE_SECRET_KEY"),
+        ("ONSHAPE_API_KEY", "ONSHAPE_API_SECRET"),
+    ):
+        access_key = (source.get(access_name) or "").strip()
+        secret_key = (source.get(secret_name) or "").strip()
+        if access_key and secret_key:
+            return OnshapeCredentials(access_key=access_key, secret_key=secret_key)
+    return OnshapeCredentials(access_key="", secret_key="")
 
 
 class OnshapeClient:
@@ -142,7 +164,17 @@ class OnshapeClient:
         Returns:
             Authorization header value
         """
-        auth_string = f"{self.credentials.access_key}:{self.credentials.secret_key}"
+        access_key = self.credentials.access_key.strip()
+        secret_key = self.credentials.secret_key.strip()
+        if not access_key or not secret_key:
+            raise OnshapeCredentialError(
+                "Onshape credentials are missing or empty. Configure either "
+                "ONSHAPE_ACCESS_KEY with ONSHAPE_SECRET_KEY, or ONSHAPE_API_KEY "
+                "with ONSHAPE_API_SECRET, in the process environment or the "
+                "repository/package-root .env file. Credential values are not "
+                "validated against Onshape until a request is sent."
+            )
+        auth_string = f"{access_key}:{secret_key}"
         encoded = base64.b64encode(auth_string.encode()).decode()
         return f"Basic {encoded}"
 

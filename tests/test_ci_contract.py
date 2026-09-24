@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 import tomllib
 from pathlib import Path
 
@@ -26,6 +27,15 @@ def test_pytest_defaults_are_fast_and_pyproject_owns_coverage_policy() -> None:
     assert config["tool"]["coverage"]["run"]["branch"] is True
     assert config["tool"]["coverage"]["report"]["fail_under"] == 80
     assert not (ROOT / ".coveragerc").exists()
+
+
+def test_plugin_defers_credentials_to_the_runtime_environment() -> None:
+    plugin = json.loads(_read(".claude-plugin/plugin.json"))
+    server = plugin["mcpServers"]["onshape"]
+
+    assert "userConfig" not in plugin
+    assert "env" not in server
+    assert server["command"] == "uv"
 
 
 def test_pr_workflow_is_one_blocking_credential_free_python_312_job() -> None:
