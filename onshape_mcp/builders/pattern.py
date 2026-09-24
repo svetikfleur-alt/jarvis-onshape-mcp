@@ -151,6 +151,8 @@ class LinearPatternBuilder:
         """
         if not self.feature_queries:
             raise ValueError("At least one feature must be added")
+        if self.count < 1:
+            raise ValueError("Pattern count must be at least 1")
 
         if self.distance_variable:
             distance_expression = f"#{self.distance_variable}"
@@ -214,12 +216,15 @@ class CircularPatternBuilder:
         self,
         name: str = "Circular pattern",
         count: int = 4,
+        axis_entity_id: Optional[str] = None,
     ):
         """Initialize circular pattern builder.
 
         Args:
             name: Name of the pattern feature
             count: Total number of instances including the original
+            axis_entity_id: Deterministic ID of an edge, cylindrical face,
+                sketched circle, or mate connector that defines the axis.
         """
         self.name = name
         self.count = count
@@ -227,6 +232,7 @@ class CircularPatternBuilder:
         self.angle_variable: Optional[str] = None
         self.feature_queries: List[str] = []
         self.axis = "Z"
+        self.axis_entity_id = axis_entity_id
 
     def set_count(self, count: int) -> "CircularPatternBuilder":
         """Set the number of pattern instances.
@@ -267,10 +273,12 @@ class CircularPatternBuilder:
         return self
 
     def set_axis(self, axis: str) -> "CircularPatternBuilder":
-        """Set the pattern rotation axis.
+        """LEGACY: retain an axis label without guessing a datum-axis query.
 
         Args:
-            axis: Rotation axis ("X", "Y", or "Z")
+            axis: Rotation axis label ("X", "Y", or "Z"). This is not
+                sufficient to build; call ``set_axis_entity`` with a real
+                deterministic entity ID.
 
         Returns:
             Self for chaining
@@ -278,30 +286,34 @@ class CircularPatternBuilder:
         self.axis = axis
         return self
 
+    def set_axis_entity(self, entity_id: str) -> "CircularPatternBuilder":
+        """Set the pattern axis from a deterministic Onshape entity ID."""
+        self.axis_entity_id = entity_id
+        return self
+
     def _build_axis_query(self) -> Dict[str, Any]:
-        """Build the rotation axis query parameter.
+        """Build the rotation-axis query from an explicit entity.
 
         Returns:
             Axis query parameter dictionary
         """
-        axis_map = {
-            "X": "RIGHT",
-            "Y": "TOP",
-            "Z": "FRONT",
-        }
-        axis_value = axis_map.get(self.axis, "FRONT")
+        if not isinstance(self.axis_entity_id, str) or not self.axis_entity_id.strip():
+            raise ValueError(
+                "CircularPatternBuilder axis_entity_id must be a non-blank string. "
+                "Pass the deterministic ID of a valid axis entity from list_entities."
+            )
 
         return {
             "btType": "BTMParameterQueryList-148",
             "queries": [
                 {
                     "btType": "BTMIndividualQuery-138",
-                    "deterministicIds": [],
+                    "deterministicIds": [self.axis_entity_id],
                     "queryStatement": None,
-                    "queryString": f'query = qCreatedBy(makeId("{axis_value}"), EntityType.EDGE);',
+                    "queryString": "",
                 }
             ],
-            "parameterId": "axisQuery",
+            "parameterId": "axis",
             "parameterName": "",
         }
 
@@ -316,6 +328,8 @@ class CircularPatternBuilder:
         """
         if not self.feature_queries:
             raise ValueError("At least one feature must be added")
+        if self.count < 1:
+            raise ValueError("Pattern count must be at least 1")
 
         angle_expression = (
             f"#{self.angle_variable}" if self.angle_variable else f"{self.angle} deg"
@@ -331,14 +345,9 @@ class CircularPatternBuilder:
                 "namespace": "",
                 "parameters": [
                     {
-                        "btType": "BTMParameterQueryList-148",
-                        "queries": [
-                            {
-                                "btType": "BTMIndividualQuery-138",
-                                "deterministicIds": self.feature_queries,
-                            }
-                        ],
-                        "parameterId": "entities",
+                        "btType": "BTMParameterFeatureList-1749",
+                        "featureIds": self.feature_queries,
+                        "parameterId": "instanceFunction",
                         "parameterName": "",
                     },
                     self._build_axis_query(),
@@ -366,6 +375,12 @@ class CircularPatternBuilder:
                         "units": "",
                         "expression": str(self.count),
                         "parameterId": "instanceCount",
+                        "parameterName": "",
+                    },
+                    {
+                        "btType": "BTMParameterBoolean-144",
+                        "value": True,
+                        "parameterId": "equalSpace",
                         "parameterName": "",
                     },
                 ],

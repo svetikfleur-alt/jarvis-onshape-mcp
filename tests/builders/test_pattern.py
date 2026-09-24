@@ -155,6 +155,14 @@ class TestLinearPatternBuilder:
         assert count_param["isInteger"] is True
         assert count_param["expression"] == "5"
 
+    def test_build_rejects_instance_count_below_one(self):
+        """A zero count is outside Onshape's documented pattern contract."""
+        lp = LinearPatternBuilder(count=0, direction_edge_id="EDGE1")
+        lp.add_feature("f1")
+
+        with pytest.raises(ValueError, match="count must be at least 1"):
+            lp.build()
+
     def test_build_pattern_type_is_feature(self):
         lp = LinearPatternBuilder(direction_edge_id="EDGE1")
         lp.add_feature("f1")
@@ -176,6 +184,7 @@ class TestCircularPatternBuilder:
         assert cp.angle_variable is None
         assert cp.feature_queries == []
         assert cp.axis == "Z"
+        assert cp.axis_entity_id is None
 
     def test_initialization_with_custom_values(self):
         cp = CircularPatternBuilder(name="MyCircular", count=8)
@@ -218,7 +227,7 @@ class TestCircularPatternBuilder:
             cp.build()
 
     def test_build_structure(self):
-        cp = CircularPatternBuilder(name="TestCP")
+        cp = CircularPatternBuilder(name="TestCP", axis_entity_id="axis-1")
         cp.add_feature("f1")
         result = cp.build()
 
@@ -228,18 +237,44 @@ class TestCircularPatternBuilder:
         assert feature["featureType"] == "circularPattern"
         assert feature["name"] == "TestCP"
 
-    def test_build_axis_mapping(self):
-        for axis, expected in [("X", "RIGHT"), ("Y", "TOP"), ("Z", "FRONT")]:
-            cp = CircularPatternBuilder()
-            cp.add_feature("f1").set_axis(axis)
-            result = cp.build()
-            params = result["feature"]["parameters"]
-            axis_param = next(p for p in params if p["parameterId"] == "axisQuery")
-            assert expected in axis_param["queries"][0]["queryString"]
+    def test_build_requires_explicit_axis_entity(self):
+        cp = CircularPatternBuilder()
+        cp.add_feature("f1")
+
+        with pytest.raises(ValueError, match="axis_entity_id"):
+            cp.build()
+
+    def test_build_rejects_blank_axis_entity(self):
+        """Whitespace is not a usable deterministic Onshape entity ID."""
+        cp = CircularPatternBuilder(axis_entity_id="   ")
+        cp.add_feature("f1")
+
+        with pytest.raises(ValueError, match="non-blank string"):
+            cp.build()
+
+    def test_build_uses_current_feature_axis_and_equal_space_parameters(self):
+        """Catch regression to entities/axisQuery or per-instance angle semantics."""
+        cp = CircularPatternBuilder(axis_entity_id="axis-1")
+        cp.add_feature("f1").add_feature("f2")
+
+        params = {
+            parameter["parameterId"]: parameter
+            for parameter in cp.build()["feature"]["parameters"]
+        }
+
+        instances = params["instanceFunction"]
+        assert instances["btType"] == "BTMParameterFeatureList-1749"
+        assert instances["featureIds"] == ["f1", "f2"]
+        axis = params["axis"]
+        assert axis["btType"] == "BTMParameterQueryList-148"
+        assert axis["queries"][0]["deterministicIds"] == ["axis-1"]
+        assert params["equalSpace"]["value"] is True
+        assert "entities" not in params
+        assert "axisQuery" not in params
 
     def test_build_angle_without_variable(self):
         cp = CircularPatternBuilder()
-        cp.add_feature("f1")
+        cp.add_feature("f1").set_axis_entity("axis-1")
         result = cp.build()
         params = result["feature"]["parameters"]
 
@@ -248,7 +283,7 @@ class TestCircularPatternBuilder:
 
     def test_build_angle_with_variable(self):
         cp = CircularPatternBuilder()
-        cp.set_angle(180.0, variable_name="ang")
+        cp.set_angle(180.0, variable_name="ang").set_axis_entity("axis-1")
         cp.add_feature("f1")
         result = cp.build()
         params = result["feature"]["parameters"]
@@ -257,7 +292,7 @@ class TestCircularPatternBuilder:
         assert angle["expression"] == "#ang"
 
     def test_build_count_parameter(self):
-        cp = CircularPatternBuilder(count=6)
+        cp = CircularPatternBuilder(count=6, axis_entity_id="axis-1")
         cp.add_feature("f1")
         result = cp.build()
         params = result["feature"]["parameters"]
@@ -266,15 +301,22 @@ class TestCircularPatternBuilder:
         assert count_param["value"] == 6
         assert count_param["isInteger"] is True
 
+    def test_build_rejects_instance_count_below_one(self):
+        cp = CircularPatternBuilder(count=0, axis_entity_id="axis-1")
+        cp.add_feature("f1")
+
+        with pytest.raises(ValueError, match="count must be at least 1"):
+            cp.build()
+
     def test_method_chaining(self):
         cp = (
             CircularPatternBuilder(name="Chained")
             .set_count(8)
             .set_angle(270.0, variable_name="a")
-            .set_axis("Y")
+            .set_axis_entity("axis-1")
             .add_feature("f1")
         )
         assert cp.count == 8
         assert cp.angle == 270.0
-        assert cp.axis == "Y"
+        assert cp.axis_entity_id == "axis-1"
         assert len(cp.feature_queries) == 1

@@ -1894,7 +1894,12 @@ async def list_tools() -> list[Tool]:
                         "type": ["number", "string"],
                         "description": "Distance between pattern instances. Bare numbers are mm; use \"10 mm\" / \"0.5 in\" for explicit units.",
                     },
-                    "count": {"type": "integer", "description": "Total number of instances", "default": 2},
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Total number of instances including the seed",
+                        "default": 2,
+                    },
                     "directionEdgeId": {
                         "type": "string",
                         "description": (
@@ -1913,7 +1918,12 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="create_circular_pattern",
-            description="Create a circular pattern of features around an axis",
+            description=(
+                "Create an equal-spaced circular FEATURE pattern around an explicit "
+                "axis entity. Get a deterministic ID for a linear edge, cylindrical "
+                "face, sketched circle, or mate connector, then pass it as "
+                "axisEntityId. The angle is the total span of the pattern."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1926,16 +1936,26 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Feature IDs to pattern",
                     },
-                    "count": {"type": "integer", "description": "Total number of instances"},
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Total number of instances including the seed",
+                    },
                     "angle": {"type": "number", "description": "Total angle spread in degrees", "default": 360},
-                    "axis": {
+                    "axisEntityId": {
                         "type": "string",
-                        "enum": ["X", "Y", "Z"],
-                        "description": "Pattern axis",
-                        "default": "Z",
+                        "minLength": 1,
+                        "pattern": r".*\S.*",
+                        "description": (
+                            "Deterministic ID of the edge, cylindrical face, sketched "
+                            "circle, or mate connector that defines the pattern axis"
+                        ),
                     },
                 },
-                "required": ["documentId", "workspaceId", "elementId", "featureIds", "count"],
+                "required": [
+                    "documentId", "workspaceId", "elementId",
+                    "featureIds", "count", "axisEntityId",
+                ],
             },
         ),
         Tool(
@@ -5400,9 +5420,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             pattern = CircularPatternBuilder(
                 name=arguments.get("name", "Circular pattern"),
                 count=arguments["count"],
+                axis_entity_id=arguments.get("axisEntityId"),
             )
             pattern.set_angle(arguments.get("angle", 360.0))
-            pattern.set_axis(arguments.get("axis", "Z"))
             for fid in arguments["featureIds"]:
                 pattern.add_feature(fid)
             result = await apply_feature_and_check(
