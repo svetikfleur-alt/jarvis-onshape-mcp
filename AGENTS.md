@@ -1,6 +1,6 @@
 # Jarvis Agent Rules
 
-Scope: repository-specific overlay for `svetikfleur-alt/jarvis-onshape-mcp`.  
+Scope: repository-specific overlay for `svetikfleur-alt/jarvis-onshape-mcp`.
 The global Agent Operating Standard still applies. These rules specialize Jarvis behavior within this repository.
 
 ## Repository identity and map
