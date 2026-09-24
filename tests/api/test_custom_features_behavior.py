@@ -538,9 +538,16 @@ async def test_failed_apply_cleans_up_only_the_exact_created_feature(monkeypatch
             feature_id=feature_id,
             feature_name="Synthetic feature",
             feature_type="syntheticFeature",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=True,
             mutation_verification="verified",
             changed=True,
+            verification_scope="feature_absence",
             reason_code="FEATURE_ABSENCE_VERIFIED",
+            verification_message=(
+                "Feature absence was confirmed by authoritative reread."
+            ),
         )
 
     monkeypatch.setattr(manager, "instantiate_custom_feature", fake_instantiate)
@@ -574,14 +581,16 @@ async def test_failed_apply_cleans_up_only_the_exact_created_feature(monkeypatch
         "feature_type": "syntheticFeature",
         "feature_name": "Synthetic feature",
         "error_message": None,
-        "transport_ok": None,
-        "http_ok": None,
-        "regen_ok": None,
+        "transport_ok": True,
+        "http_ok": True,
+        "regen_ok": True,
         "mutation_verification": "verified",
         "changed": True,
-        "verification_scope": "none",
+        "verification_scope": "feature_absence",
         "reason_code": "FEATURE_ABSENCE_VERIFIED",
-        "verification_message": None,
+        "verification_message": (
+            "Feature absence was confirmed by authoritative reread."
+        ),
     }
 
 
