@@ -43,6 +43,8 @@ def _apply_result(*, ok: bool = True) -> FeatureApplyResult:
         feature_name="Synthetic feature",
         feature_type="syntheticFeature",
         error_message=None if ok else "REGEN_ERROR (ERROR)",
+        regen_ok=ok,
+        mutation_verification="verified" if ok else "failed",
     )
 
 
@@ -180,7 +182,7 @@ async def test_instantiate_custom_feature_converts_parameters_and_builds_namespa
             {"id": "length", "type": "quantity", "value": "5 mm"},
             {"id": "count", "type": "real", "value": 2.5},
             {"id": "label", "type": "string", "value": None},
-            {"id": "enabled", "type": "boolean", "value": 1},
+            {"id": "enabled", "type": "boolean", "value": True},
         ],
     )
 
@@ -273,7 +275,7 @@ async def test_instantiate_requires_source_microversion_before_applying():
             {"btType": "BTMParameterString-149", "parameterId": "label", "value": "7"},
         ),
         (
-            {"id": "enabled", "type": "boolean", "value": 0},
+            {"id": "enabled", "type": "boolean", "value": False},
             {
                 "btType": "BTMParameterBoolean-144",
                 "parameterId": "enabled",
@@ -306,6 +308,12 @@ def test_parameter_conversion_normalizes_supported_values(descriptor, expected):
 def test_parameter_conversion_rejects_missing_ids_and_unknown_types(descriptor, message):
     with pytest.raises(ValueError, match=message):
         _to_onshape_parameter(descriptor)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true"])
+def test_boolean_parameter_rejects_non_boolean_values(value):
+    with pytest.raises(ValueError, match="boolean parameter .* requires true or false"):
+        _to_onshape_parameter({"id": "enabled", "type": "boolean", "value": value})
 
 
 def test_namespace_uses_supported_element_and_microversion_prefixes():
@@ -489,6 +497,251 @@ async def test_failed_apply_is_enriched_with_featurescript_notices(monkeypatch):
         "part-studio",
         "opBad();",
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_apply_cleans_up_only_the_exact_created_feature(monkeypatch):
+    client = _RecordingClient(
+        post_results=[{"id": "synthetic-fs"}, {}],
+        get_results=[
+            {
+                "featureSpecs": [
+                    {
+                        "featureType": "syntheticFeature",
+                        "sourceMicroversionId": "selected-micro",
+                    }
+                ]
+            }
+        ],
+    )
+    manager = _manager_after_version_discovery(client)
+    captured: dict[str, Any] = {}
+
+    async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        return _apply_result(ok=False)
+
+    async def fake_delete(
+        partstudio_manager: Any,
+        document_id: str,
+        workspace_id: str,
+        element_id: str,
+        feature_id: str,
+    ) -> FeatureApplyResult:
+        captured.update(
+            manager=partstudio_manager,
+            ids=(document_id, workspace_id, element_id, feature_id),
+        )
+        return FeatureApplyResult(
+            ok=True,
+            status="OK",
+            feature_id=feature_id,
+            feature_name="Synthetic feature",
+            feature_type="syntheticFeature",
+            mutation_verification="verified",
+            changed=True,
+            reason_code="FEATURE_ABSENCE_VERIFIED",
+        )
+
+    monkeypatch.setattr(manager, "instantiate_custom_feature", fake_instantiate)
+    monkeypatch.setattr(
+        "onshape_mcp.api.custom_features.delete_partstudio_feature_and_check",
+        fake_delete,
+        raising=False,
+    )
+    monkeypatch.setattr("onshape_mcp.api.custom_features.extract_fs_body", lambda source: None)
+
+    result = await manager.apply_featurescript_feature(
+        "doc",
+        "workspace",
+        "part-studio",
+        feature_type="syntheticFeature",
+        feature_script="FeatureScript 2931;\nsynthetic source",
+        feature_name="Synthetic feature",
+    )
+
+    assert captured["ids"] == (
+        "doc",
+        "workspace",
+        "part-studio",
+        "synthetic-applied-feature",
+    )
+    assert result["cleanup"] == {
+        "attempted": True,
+        "ok": True,
+        "status": "OK",
+        "feature_id": "synthetic-applied-feature",
+        "feature_type": "syntheticFeature",
+        "feature_name": "Synthetic feature",
+        "error_message": None,
+        "transport_ok": None,
+        "http_ok": None,
+        "regen_ok": None,
+        "mutation_verification": "verified",
+        "changed": True,
+        "verification_scope": "none",
+        "reason_code": "FEATURE_ABSENCE_VERIFIED",
+        "verification_message": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_apply_without_exact_feature_id_reports_cleanup_not_attempted(
+    monkeypatch,
+):
+    client = _RecordingClient(
+        post_results=[{"id": "synthetic-fs"}, {}],
+        get_results=[
+            {
+                "featureSpecs": [
+                    {
+                        "featureType": "syntheticFeature",
+                        "sourceMicroversionId": "selected-micro",
+                    }
+                ]
+            }
+        ],
+    )
+    manager = _manager_after_version_discovery(client)
+
+    async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        failed = _apply_result(ok=False)
+        failed.feature_id = ""
+        return failed
+
+    async def unexpected_delete(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        raise AssertionError("cleanup must not guess a feature id")
+
+    monkeypatch.setattr(manager, "instantiate_custom_feature", fake_instantiate)
+    monkeypatch.setattr(
+        "onshape_mcp.api.custom_features.delete_partstudio_feature_and_check",
+        unexpected_delete,
+        raising=False,
+    )
+    monkeypatch.setattr("onshape_mcp.api.custom_features.extract_fs_body", lambda source: None)
+
+    result = await manager.apply_featurescript_feature(
+        "doc",
+        "workspace",
+        "part-studio",
+        feature_type="syntheticFeature",
+        feature_script="FeatureScript 2931;\nsynthetic source",
+        feature_name="Synthetic feature",
+    )
+
+    assert result["cleanup"] == {
+        "attempted": False,
+        "ok": False,
+        "feature_id": "",
+        "reason_code": "CUSTOM_FEATURE_CLEANUP_ID_UNAVAILABLE",
+        "error_message": "Cleanup was not attempted because the failed feature has no exact feature ID.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cleanup_exception_is_reported_without_hiding_primary_failure(monkeypatch):
+    client = _RecordingClient(
+        post_results=[{"id": "synthetic-fs"}, {}],
+        get_results=[
+            {
+                "featureSpecs": [
+                    {
+                        "featureType": "syntheticFeature",
+                        "sourceMicroversionId": "selected-micro",
+                    }
+                ]
+            }
+        ],
+    )
+    manager = _manager_after_version_discovery(client)
+
+    async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        return _apply_result(ok=False)
+
+    async def broken_delete(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        raise RuntimeError("synthetic cleanup failure")
+
+    monkeypatch.setattr(manager, "instantiate_custom_feature", fake_instantiate)
+    monkeypatch.setattr(
+        "onshape_mcp.api.custom_features.delete_partstudio_feature_and_check",
+        broken_delete,
+        raising=False,
+    )
+    monkeypatch.setattr("onshape_mcp.api.custom_features.extract_fs_body", lambda source: None)
+
+    result = await manager.apply_featurescript_feature(
+        "doc",
+        "workspace",
+        "part-studio",
+        feature_type="syntheticFeature",
+        feature_script="FeatureScript 2931;\nsynthetic source",
+        feature_name="Synthetic feature",
+    )
+
+    assert result["apply_result"].error_message == "REGEN_ERROR (ERROR)"
+    assert result["cleanup"]["attempted"] is True
+    assert result["cleanup"]["ok"] is False
+    assert result["cleanup"]["feature_id"] == "synthetic-applied-feature"
+    assert result["cleanup"]["reason_code"] == "CUSTOM_FEATURE_CLEANUP_FAILED"
+    assert "synthetic cleanup failure" in result["cleanup"]["error_message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verification", "regen_ok"),
+    [("unverified", None), ("no_effect", True), ("failed", True)],
+)
+async def test_nonconclusive_apply_does_not_trigger_cleanup(
+    monkeypatch, verification, regen_ok
+):
+    client = _RecordingClient(
+        post_results=[{"id": "synthetic-fs"}, {}],
+        get_results=[
+            {
+                "featureSpecs": [
+                    {
+                        "featureType": "syntheticFeature",
+                        "sourceMicroversionId": "selected-micro",
+                    }
+                ]
+            }
+        ],
+    )
+    manager = _manager_after_version_discovery(client)
+
+    async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        result = _apply_result(ok=False)
+        result.mutation_verification = verification
+        result.regen_ok = regen_ok
+        return result
+
+    async def unexpected_delete(*args: Any, **kwargs: Any) -> FeatureApplyResult:
+        del args, kwargs
+        raise AssertionError("cleanup requires a conclusive failed state")
+
+    monkeypatch.setattr(manager, "instantiate_custom_feature", fake_instantiate)
+    monkeypatch.setattr(
+        "onshape_mcp.api.custom_features.delete_partstudio_feature_and_check",
+        unexpected_delete,
+        raising=False,
+    )
+    monkeypatch.setattr("onshape_mcp.api.custom_features.extract_fs_body", lambda source: None)
+
+    result = await manager.apply_featurescript_feature(
+        "doc",
+        "workspace",
+        "part-studio",
+        feature_type="syntheticFeature",
+        feature_script="FeatureScript 2931;\nsynthetic source",
+        feature_name="Synthetic feature",
+    )
+
+    assert "cleanup" not in result
 
 
 @pytest.mark.asyncio

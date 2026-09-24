@@ -5,6 +5,7 @@ import base64
 from unittest.mock import Mock
 import httpx
 
+import onshape_mcp.api.client as client_api
 from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
 
 
@@ -48,6 +49,43 @@ class TestOnshapeCredentials:
         with pytest.raises(Exception):
             OnshapeCredentials(access_key="test_key")
 
+    @pytest.mark.parametrize(
+        ("environment", "expected"),
+        [
+            (
+                {
+                    "ONSHAPE_ACCESS_KEY": " access-key ",
+                    "ONSHAPE_SECRET_KEY": " secret-key ",
+                    "ONSHAPE_API_KEY": "api-key",
+                    "ONSHAPE_API_SECRET": "api-secret",
+                },
+                ("access-key", "secret-key"),
+            ),
+            (
+                {
+                    "ONSHAPE_API_KEY": " api-key ",
+                    "ONSHAPE_API_SECRET": " api-secret ",
+                },
+                ("api-key", "api-secret"),
+            ),
+            (
+                {
+                    "ONSHAPE_ACCESS_KEY": "access-only",
+                    "ONSHAPE_API_SECRET": "secret-only",
+                },
+                ("", ""),
+            ),
+        ],
+    )
+    def test_runtime_alias_resolution_uses_only_complete_pairs(
+        self, environment, expected
+    ):
+        resolver = getattr(client_api, "resolve_onshape_credentials", None)
+        assert callable(resolver), "runtime credential resolver is missing"
+        credentials = resolver(environment)
+
+        assert (credentials.access_key, credentials.secret_key) == expected
+
 
 class TestOnshapeClient:
     """Test OnshapeClient HTTP operations."""
@@ -73,6 +111,34 @@ class TestOnshapeClient:
 
         assert result == {"source": "injected"}
         assert transport.calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("access_key", "secret_key"),
+        [("", ""), ("   ", "secret-canary"), ("access-canary", "\t")],
+    )
+    async def test_missing_or_empty_credentials_fail_before_transport(
+        self, access_key, secret_key
+    ):
+        credential_error = getattr(client_api, "OnshapeCredentialError", None)
+        assert credential_error is not None, "credential boundary error is missing"
+        transport = _RecordingTransport()
+        client = OnshapeClient(
+            OnshapeCredentials(access_key=access_key, secret_key=secret_key),
+            transport=transport,
+        )
+
+        with pytest.raises(credential_error) as caught:
+            await client.get("/api/v9/documents")
+
+        message = str(caught.value)
+        assert transport.calls == 0
+        assert "ONSHAPE_ACCESS_KEY" in message
+        assert "ONSHAPE_SECRET_KEY" in message
+        assert "ONSHAPE_API_KEY" in message
+        assert "ONSHAPE_API_SECRET" in message
+        assert "access-canary" not in message
+        assert "secret-canary" not in message
 
     @pytest.mark.asyncio
     async def test_injected_transport_is_used_by_context_manager(self, mock_credentials):

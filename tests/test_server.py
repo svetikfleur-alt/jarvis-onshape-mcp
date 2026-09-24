@@ -267,6 +267,12 @@ async def test_featurescript_mutation_serializer_uses_same_raw_poison_boundary(
             "apply_result": _mock_apply_result(raw=poisons),
             "fs_element_id": "safe-fs-id",
             "source_microversion_id": "safe-microversion",
+            "cleanup": {
+                "attempted": True,
+                "ok": True,
+                "feature_id": "safe-feature-id",
+                "reason_code": "FEATURE_ABSENCE_VERIFIED",
+            },
         }
     )
 
@@ -282,8 +288,15 @@ async def test_featurescript_mutation_serializer_uses_same_raw_poison_boundary(
         },
     )
     rendered = result[0].text
+    parsed = __import__("json").loads(rendered)
 
     assert "raw" not in rendered
+    assert parsed["cleanup"] == {
+        "attempted": True,
+        "ok": True,
+        "feature_id": "safe-feature-id",
+        "reason_code": "FEATURE_ABSENCE_VERIFIED",
+    }
     for poison in poisons.values():
         assert poison not in rendered
 

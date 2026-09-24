@@ -18,7 +18,7 @@ from loguru import logger
 _package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_package_dir, ".env"))
 
-from .api.client import OnshapeClient, OnshapeCredentials
+from .api.client import OnshapeClient, resolve_onshape_credentials
 from .api.request_guard import (
     LiveApiBudgetExceeded,
     safe_exception_message,
@@ -189,12 +189,9 @@ list_entities, or from create_offset_plane).
 
 app = Server("onshape-mcp", instructions=_INSTRUCTIONS)
 
-# Initialize Onshape client. Accept both naming conventions: upstream uses
-# ONSHAPE_ACCESS_KEY/SECRET_KEY, Onshape's developer portal examples use
-# ONSHAPE_API_KEY/SECRET. Fall back from the former to the latter.
-_ak = os.getenv("ONSHAPE_ACCESS_KEY") or os.getenv("ONSHAPE_API_KEY", "")
-_sk = os.getenv("ONSHAPE_SECRET_KEY") or os.getenv("ONSHAPE_API_SECRET", "")
-credentials = OnshapeCredentials(access_key=_ak, secret_key=_sk)
+# Initialize without making imports or schema/listing operations depend on
+# credentials. The client rejects a missing/empty pair at the request boundary.
+credentials = resolve_onshape_credentials()
 client = OnshapeClient(credentials)
 partstudio_manager = PartStudioManager(client)
 variable_manager = VariableManager(client)
@@ -2538,7 +2535,8 @@ async def list_tools() -> list[Tool]:
                 "```\n"
                 "`parameters` is a list of `{id, type, value}` dicts to bind "
                 "precondition variables. type ∈ {quantity, string, boolean, real}. "
-                "For quantity, value is a unit-tagged string like \"25 mm\" or \"0.5 in\"."
+                "For quantity, value is a unit-tagged string like \"25 mm\" or \"0.5 in\". "
+                "For boolean, value must be the JSON literal true or false."
             ),
             inputSchema={
                 "type": "object",
@@ -6123,6 +6121,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 "source_microversion_id": out.get("source_microversion_id"),
                 "tool": "write_featurescript_feature",
             })
+            if out.get("cleanup") is not None:
+                payload["cleanup"] = out["cleanup"]
             return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]

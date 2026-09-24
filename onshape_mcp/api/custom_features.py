@@ -40,8 +40,13 @@ from loguru import logger
 from .request_guard import safe_exception_message
 
 from .client import OnshapeClient
-from .feature_apply import FeatureApplyResult, apply_feature_and_check
+from .feature_apply import (
+    FeatureApplyResult,
+    apply_feature_and_check,
+    delete_partstudio_feature_and_check,
+)
 from .fs_notices import extract_fs_body, fetch_body_notices, format_notices
+from .partstudio import PartStudioManager
 
 
 # Onshape's public standard library document. Latest version entry = current
@@ -397,12 +402,56 @@ class CustomFeatureManager:
                     "FS body re-eval enrichment failed: {}", safe_exception_message(e)
                 )
 
-        return {
+        cleanup: Optional[Dict[str, Any]] = None
+        if (
+            apply_result.mutation_verification == "failed"
+            and apply_result.regen_ok is False
+        ):
+            if not apply_result.feature_id:
+                cleanup = {
+                    "attempted": False,
+                    "ok": False,
+                    "feature_id": "",
+                    "reason_code": "CUSTOM_FEATURE_CLEANUP_ID_UNAVAILABLE",
+                    "error_message": (
+                        "Cleanup was not attempted because the failed feature has no "
+                        "exact feature ID."
+                    ),
+                }
+            else:
+                try:
+                    cleanup_result = await delete_partstudio_feature_and_check(
+                        PartStudioManager(self.client),
+                        document_id,
+                        workspace_id,
+                        part_studio_element_id,
+                        apply_result.feature_id,
+                    )
+                    cleanup = {
+                        "attempted": True,
+                        **cleanup_result.public_dict(),
+                    }
+                except Exception as error:  # noqa: BLE001
+                    cleanup = {
+                        "attempted": True,
+                        "ok": False,
+                        "feature_id": apply_result.feature_id,
+                        "reason_code": "CUSTOM_FEATURE_CLEANUP_FAILED",
+                        "error_message": (
+                            "Failed custom-feature cleanup: "
+                            f"{safe_exception_message(error)}"
+                        ),
+                    }
+
+        result = {
             "apply_result": apply_result,
             "fs_element_id": fs_eid,
             "source_microversion_id": source_microversion,
             "fs_library_version": specs.get("libraryVersion"),
         }
+        if cleanup is not None:
+            result["cleanup"] = cleanup
+        return result
 
 
 # ---- helpers ---------------------------------------------------------------
@@ -454,10 +503,15 @@ def _to_onshape_parameter(param: Dict[str, Any]) -> Dict[str, Any]:
             "value": "" if value is None else str(value),
         }
     if ptype == "boolean":
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"boolean parameter {pid!r} requires true or false, got "
+                f"{type(value).__name__}"
+            )
         return {
             "btType": "BTMParameterBoolean-144",
             "parameterId": pid,
-            "value": bool(value),
+            "value": value,
         }
     if ptype == "real":
         return {

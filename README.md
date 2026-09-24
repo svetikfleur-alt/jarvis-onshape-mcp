@@ -59,13 +59,19 @@ benchmark data behind that workflow.
 /plugin install github:ReshefElisha/jarvis-onshape-mcp
 ```
 
-Claude Code will prompt you for:
+Get a key pair at [dev-portal.onshape.com](https://dev-portal.onshape.com/),
+then configure exactly one complete pair in the environment that launches the
+MCP server:
 
-- `ONSHAPE_API_KEY` — the "Access Key" from the Onshape developer portal.
-- `ONSHAPE_API_SECRET` — the "Secret Key" shown once when you create the key pair.
+- `ONSHAPE_ACCESS_KEY` plus `ONSHAPE_SECRET_KEY`; or
+- `ONSHAPE_API_KEY` plus `ONSHAPE_API_SECRET`.
 
-Get a key pair at [dev-portal.onshape.com](https://dev-portal.onshape.com/).
-Both values are stored in the OS keychain and never written to disk in plaintext.
+When running from a checkout, the server also loads the same names from a
+`.env` file at the repository/package root. This repository does not implement
+or promise a Claude Code/Desktop credential prompt or OS-keychain flow; those
+are external-client behaviors. Missing, empty, and whitespace-only values fail
+locally before the first Onshape request. Non-empty credentials are not claimed
+valid, unrevoked, or correctly scoped until Onshape accepts a request.
 
 ### Requirements
 
