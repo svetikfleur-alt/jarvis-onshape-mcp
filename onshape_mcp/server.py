@@ -38,13 +38,18 @@ from .api.export import ExportManager
 from .api.feature_apply import (
     apply_feature_and_check,
     apply_assembly_feature_and_check,
+    delete_partstudio_feature_and_check,
     update_feature_params_and_check,
     FeatureApplyResult,
 )
 from .api.entities import EntityManager
 from .api.describe import DescribeManager
 from .api.measurements import MeasurementManager
-from .api.custom_features import CustomFeatureManager
+from .api.custom_features import (
+    CustomFeatureManager,
+    FeatureScriptVersionDiscoveryError,
+    FeatureScriptVersionError,
+)
 from .api.drawing_ocr import callouts_to_dict, extract_callouts
 from .api.rendering import (
     ShadedViewManager,
@@ -126,7 +131,8 @@ list_entities, or from create_offset_plane).
 
 ### Features (Part Studio)
 - create_extrude — BLIND or SYMMETRIC; NEW / ADD / REMOVE / INTERSECT
-- create_revolve / create_thicken
+- create_thicken; create_revolve is retained but fails closed until the current
+  native axis-reference payload is established
 - create_fillet / create_chamfer
 - create_shell — hollow a body; pass faceIds to remove; inward by default (bbox preserved)
 - create_offset_plane — signed offset from a datum (Front/Top/Right) or a face; pass feature_id as faceId into any sketch primitive
@@ -1835,7 +1841,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="create_revolve",
-            description="Create a revolve feature by rotating a sketch around an axis",
+            description=(
+                "Reserved native revolve surface. Currently fails closed before "
+                "transport because the former X/Y/Z datum-plane edge query "
+                "regenerates ERROR and no replacement payload is established."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2509,13 +2519,16 @@ async def list_tools() -> list[Tool]:
                 "confirms it compiles, fetches the sourceMicroversionId, and "
                 "instantiates a BTMFeature-134 with the correct "
                 "`e{fs_eid}::m{microversion}` namespace.\n\n"
-                "`featureScript` is a COMPLETE FS source file. Prelude: "
-                "`FeatureScript 2909;\\nimport(path:\"onshape/std/geometry.fs\",version:\"2909.0\");`. "
+                "`featureScript` is a COMPLETE FS source file. The manager "
+                "discovers the current standard-library version before mutation; "
+                "the `FeatureScript N;` prelude and only `onshape/std/...` imports "
+                "must use N (or N.0 for imports). Linked/custom/workspace imports "
+                "retain their own reference or microversion semantics. "
                 "Export exactly one `defineFeature(...)` whose binding name matches "
                 "the `featureType` arg. Minimal worked example (offset plane):\n"
                 "```\n"
-                "FeatureScript 2909;\n"
-                "import(path:\"onshape/std/geometry.fs\",version:\"2909.0\");\n"
+                "FeatureScript N; // replace N with the current discovered version\n"
+                "import(path:\"onshape/std/geometry.fs\",version:\"N.0\");\n"
                 "annotation { \"Feature Type Name\" : \"My feat\" }\n"
                 "export const myFeat = defineFeature(function(context is Context, id is Id, definition is map)\n"
                 "    precondition { annotation{\"Name\":\"Offset\"} isLength(definition.offset, LENGTH_BOUNDS); }\n"
@@ -2721,6 +2734,14 @@ def _hints_for_result(result: FeatureApplyResult) -> list[str]:
       - EXCEPTION   -> handled in `_exception_json`, not here.
       - UNKNOWN     -> conservative: suggest describe_part_studio to learn state.
     """
+    if result.mutation_verification == "unverified":
+        return [
+            "Transport may have succeeded, but Jarvis could not verify the requested CAD state. Inspect the feature before continuing."
+        ]
+    if result.mutation_verification == "no_effect":
+        return [
+            "The requested mutation had no detectable effect. Check feature and parameter IDs before retrying."
+        ]
     status = result.status
     enum_hints = _enum_specific_hints(result.error_message)
 
@@ -2786,14 +2807,7 @@ def _feature_apply_json(
     own. All three are only emitted when non-empty so existing callers see
     a stable shape.
     """
-    payload: dict[str, Any] = {
-        "ok": result.ok,
-        "status": result.status,
-        "feature_id": result.feature_id,
-        "feature_type": result.feature_type,
-        "feature_name": result.feature_name,
-        "error_message": result.error_message,
-    }
+    payload: dict[str, Any] = result.public_dict()
     if tool_name:
         payload["tool"] = tool_name
     if warnings:
@@ -2819,7 +2833,12 @@ def _safe_exception_message(error: BaseException) -> str:
 
 def _log_unexpected_error(message: str, error: BaseException) -> None:
     """Avoid tracebacks whose locals can retain raw HTTP request details."""
-    if isinstance(error, (httpx.HTTPError, LiveApiBudgetExceeded)):
+    if isinstance(
+        error,
+        (FeatureScriptVersionDiscoveryError, FeatureScriptVersionError),
+    ):
+        logger.error("{}: {}", message, type(error).__name__)
+    elif isinstance(error, (httpx.HTTPError, LiveApiBudgetExceeded)):
         logger.error("{}: {}", message, safe_exception_message(error))
     else:
         logger.exception(message)
@@ -2914,18 +2933,100 @@ def _exception_json(
     distinguish an Onshape-reported failure ("ERROR") from a plumbing failure.
 
     Default hints point Claude at `describe_part_studio` to rediscover the
-    tree's current state -- an exception here usually means the feature
-    wasn't even attempted on Onshape's side, so the prior state is intact.
+    tree's current state. An exception alone cannot prove whether a mutating
+    request reached Onshape, so this projection remains unverified.
     """
+    raw_diagnostic = getattr(error, "onshape_diagnostic", None)
+    raw_diagnostic = raw_diagnostic if isinstance(raw_diagnostic, dict) else None
+    has_onshape_diagnostic = (
+        raw_diagnostic is not None and isinstance(error, httpx.HTTPStatusError)
+    )
+    reason_code = getattr(error, "reason_code", None)
+    if not (
+        isinstance(reason_code, str)
+        and bool(reason_code)
+        and len(reason_code) <= 128
+        and all(
+            character.isupper() or character.isdigit() or character == "_"
+            for character in reason_code
+        )
+    ):
+        reason_code = None
+
+    diagnostic: Optional[dict[str, Any]] = None
     if isinstance(error, httpx.HTTPError):
-        diagnostic = safe_http_diagnostic(error)
-        msg = str(diagnostic)
-        if status_code is not None and diagnostic.status_code is None:
+        safe_diagnostic = safe_http_diagnostic(error)
+        msg = str(safe_diagnostic)
+        if status_code is not None and safe_diagnostic.status_code is None:
             msg = f"HTTP {status_code}: {msg}"
+
+        route = safe_diagnostic.route
+        for identifier_name in (
+            "documentId",
+            "elementId",
+            "externalDataId",
+            "featureId",
+            "microversionId",
+            "partId",
+            "translationId",
+            "workspaceId",
+        ):
+            route = route.replace(f"{{{identifier_name}}}", "{id}")
+
+        category = raw_diagnostic.get("category") if raw_diagnostic else None
+        if not (isinstance(category, str) and len(category) <= 96):
+            category = None
+        reference_path = (
+            raw_diagnostic.get("reference_path") if raw_diagnostic else None
+        )
+        if not (isinstance(reference_path, str) and len(reference_path) <= 256):
+            reference_path = None
+
+        code = safe_diagnostic.status_code or status_code
+        if has_onshape_diagnostic:
+            failure_kind = "http_rejection"
+            diagnostic_message = "Onshape rejected the request payload."
+            reason_code = reason_code or "ONSHAPE_HTTP_REJECTED"
+        elif isinstance(error, httpx.RequestError):
+            failure_kind = "transport_failure"
+            diagnostic_message = "The Onshape request could not be transported."
+            reason_code = reason_code or "ONSHAPE_TRANSPORT_FAILED"
+        else:
+            failure_kind = "http_rejection"
+            diagnostic_message = "Onshape rejected the request."
+            reason_code = reason_code or "ONSHAPE_HTTP_REJECTED"
+
+        diagnostic = {
+            "failure_kind": failure_kind,
+            "method": safe_diagnostic.method,
+            "route": route,
+            "status_code": code,
+            "category": category,
+            "reference_path": reference_path,
+            "message": diagnostic_message,
+        }
+
+    if has_onshape_diagnostic:
+        failure_kind = "http_rejection"
+        status_code = diagnostic["status_code"] if diagnostic else status_code
+        transport_ok: Optional[bool] = True
+        http_ok: Optional[bool] = False
+    elif isinstance(error, httpx.RequestError):
+        failure_kind = "transport_failure"
+        transport_ok = False
+        http_ok = None
+    elif isinstance(error, httpx.HTTPStatusError):
+        failure_kind = "http_rejection"
+        transport_ok = True
+        http_ok = False
     else:
-        msg = str(error)
-    if status_code is not None and not isinstance(error, httpx.HTTPError):
-        msg = f"HTTP {status_code}: {msg}"
+        failure_kind = "local_failure"
+        msg = safe_exception_message(error)[:500]
+        if status_code is not None:
+            msg = f"HTTP {status_code}: {msg}"
+        transport_ok = None
+        http_ok = None
+        reason_code = reason_code or "LOCAL_MUTATION_REJECTED"
     payload: dict[str, Any] = {
         "ok": False,
         "status": "EXCEPTION",
@@ -2933,13 +3034,22 @@ def _exception_json(
         "feature_type": "",
         "feature_name": "",
         "error_message": msg,
+        "transport_ok": transport_ok,
+        "http_ok": http_ok,
+        "regen_ok": None,
+        "mutation_verification": "unverified",
+        "changed": None,
+        "verification_scope": "none",
+        "failure_kind": failure_kind,
+        "reason_code": reason_code,
+        "diagnostic": diagnostic,
     }
     if tool_name:
         payload["tool"] = tool_name
     hints_list = list(hints) if hints else [
-        "Tool call raised before Onshape received it -- the feature tree "
-        "is unchanged from before this call. Call describe_part_studio to "
-        "confirm, then retry with corrected params.",
+        "Tool call raised before requested state could be verified. Inspect "
+        "the authoritative feature tree before retrying; do not assume the "
+        "request had no effect.",
         "HTTP 4xx usually means a bad tool-arg shape (missing required "
         "field, wrong type). Re-read the tool schema or ToolSearch the "
         "tool name for hints.",
@@ -3930,23 +4040,32 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 await assembly_manager.delete_feature(
                     arguments["documentId"], arguments["workspaceId"], arguments["elementId"], arguments["featureId"],
                 )
+                result = FeatureApplyResult(
+                    ok=False,
+                    status="UNKNOWN",
+                    feature_id=arguments["featureId"],
+                    feature_type="assembly",
+                    feature_name="",
+                    error_message=(
+                        "Assembly delete transport succeeded, but authoritative "
+                        "post-delete verification is outside the WP-004 Part Studio scope."
+                    ),
+                    transport_ok=True,
+                    http_ok=True,
+                    regen_ok=None,
+                    mutation_verification="unverified",
+                    changed=None,
+                    verification_scope="none",
+                    reason_code="ASSEMBLY_DELETE_UNVERIFIED",
+                )
             else:
-                await partstudio_manager.delete_feature(
+                result = await delete_partstudio_feature_and_check(
+                    partstudio_manager,
                     arguments["documentId"], arguments["workspaceId"], arguments["elementId"], arguments["featureId"],
                 )
-            # Delete has no featureStatus to report, but we use the same
-            # contract shape as the mutating handlers so LLM callers don't
-            # have to branch on whether the response is text vs JSON.
-            payload = {
-                "ok": True,
-                "status": "OK",
-                "feature_id": arguments["featureId"],
-                "feature_type": element_type.lower(),
-                "feature_name": "",
-                "error_message": None,
-                "tool": name,
-            }
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+                if not result.feature_type:
+                    result.feature_type = "partstudio"
+            return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
@@ -3987,22 +4106,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 ))]
             deleted = matches[0]
             deleted_fid = deleted["featureId"]
-            await partstudio_manager.delete_feature(
+            result = await delete_partstudio_feature_and_check(
+                partstudio_manager,
                 arguments["documentId"],
                 arguments["workspaceId"],
                 arguments["elementId"],
                 deleted_fid,
+                features_before=features_doc,
             )
-            payload = {
-                "ok": True,
-                "status": "OK",
-                "feature_id": deleted_fid,
-                "feature_type": deleted.get("featureType") or deleted.get("btType", ""),
-                "feature_name": target_name,
-                "error_message": None,
-                "tool": name,
-            }
-            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+            return [TextContent(type="text", text=_feature_apply_json(result, tool_name=name))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]
         except Exception as e:
@@ -4945,13 +5057,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 remove_ids=arguments.get("removeIds") or [],
             )
             apply = result.apply
-            payload = {
-                "ok": apply.ok,
-                "status": apply.status,
-                "feature_id": apply.feature_id,
-                "feature_type": apply.feature_type,
-                "feature_name": apply.feature_name,
-                "error_message": apply.error_message,
+            payload = apply.public_dict()
+            payload.update({
                 "added_entity_ids": result.added_entity_ids,
                 "added_constraint_ids": result.added_constraint_ids,
                 "removed_entity_ids": result.removed_entity_ids,
@@ -4961,7 +5068,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                     for c in result.cascaded_removals
                 ],
                 "tool": "edit_sketch",
-            }
+            })
             # Use the standard hint surface so enum-specific advice
             # (SKETCH_DIMENSION_MISSING_PARAMETER etc.) still fires on
             # this path.
@@ -6010,17 +6117,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 fs_element_name=arguments.get("fsElementName"),
             )
             apply = out["apply_result"]
-            payload = {
-                "ok": apply.ok,
-                "status": apply.status,
-                "feature_id": apply.feature_id,
-                "feature_type": apply.feature_type,
-                "feature_name": apply.feature_name,
-                "error_message": apply.error_message,
+            payload = apply.public_dict()
+            payload.update({
                 "fs_element_id": out["fs_element_id"],
                 "source_microversion_id": out.get("source_microversion_id"),
                 "tool": "write_featurescript_feature",
-            }
+            })
             return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name, status_code=e.response.status_code))]

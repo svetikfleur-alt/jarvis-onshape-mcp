@@ -81,21 +81,22 @@ class TestLinearPatternBuilder:
         assert feature["featureType"] == "linearPattern"
         assert feature["name"] == "TestLP"
 
-    def test_build_entities_parameter(self):
+    def test_build_instance_function_parameter(self):
         lp = LinearPatternBuilder(direction_edge_id="EDGE1")
         lp.add_feature("f1").add_feature("f2")
         result = lp.build()
         params = result["feature"]["parameters"]
 
-        entities = next(p for p in params if p["parameterId"] == "entities")
-        assert entities["queries"][0]["deterministicIds"] == ["f1", "f2"]
+        instances = next(p for p in params if p["parameterId"] == "instanceFunction")
+        assert instances["btType"] == "BTMParameterFeatureList-1749"
+        assert instances["featureIds"] == ["f1", "f2"]
 
     def test_build_direction_uses_edge_id(self):
         lp = LinearPatternBuilder(direction_edge_id="JHl")
         lp.add_feature("f1")
         result = lp.build()
         params = result["feature"]["parameters"]
-        dir_param = next(p for p in params if p["parameterId"] == "directionQuery")
+        dir_param = next(p for p in params if p["parameterId"] == "directionOne")
         assert dir_param["queries"][0]["deterministicIds"] == ["JHl"]
 
     def test_build_without_direction_edge_raises(self):
@@ -109,7 +110,7 @@ class TestLinearPatternBuilder:
         lp.add_feature("f1").set_direction_edge("JHl")
         result = lp.build()
         params = result["feature"]["parameters"]
-        dir_param = next(p for p in params if p["parameterId"] == "directionQuery")
+        dir_param = next(p for p in params if p["parameterId"] == "directionOne")
         assert dir_param["queries"][0]["deterministicIds"] == ["JHl"]
 
     def test_build_distance_without_variable(self):

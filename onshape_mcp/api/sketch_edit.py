@@ -24,6 +24,7 @@ lands on the same branch it just wires into `wire_entity_id` /
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Set, Tuple
+import math
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -124,6 +125,108 @@ def _strip_subpoint(ref: str) -> str:
     """`"line1.start"` -> `"line1"`. Sub-point references count as
     referencing the parent entity for cascade purposes."""
     return ref.split(".", 1)[0] if "." in ref else ref
+
+
+_SKETCH_COMPARE_IGNORED = {
+    "nodeId",
+    "parameterName",
+    "namespace",
+    "libraryRelationType",
+    "index",
+}
+_SKETCH_STABLE_KEYS = {
+    "btType",
+    "entityId",
+    "id",
+    "constraintType",
+    "parameterId",
+    "enumName",
+    "isConstruction",
+}
+_REFERENCE_PARAMETER_IDS = {
+    "localFirst",
+    "localSecond",
+    "entityId",
+    "firstEntity",
+    "secondEntity",
+}
+
+
+def _sketch_scalar_equal(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected is actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return math.isclose(float(expected), float(actual), rel_tol=1e-9, abs_tol=1e-12)
+    if isinstance(expected, str) and isinstance(actual, str):
+        return expected.strip() == actual.strip()
+    return expected == actual
+
+
+def _compare_requested_sketch_entry(
+    expected: Any,
+    actual: Any,
+    *,
+    field_name: Optional[str] = None,
+    parameter_id: Optional[str] = None,
+) -> Optional[bool]:
+    """Compare a safe projection of requested serialized sketch fields.
+
+    ``None`` is deliberately returned for geometry/expression differences
+    that could be server canonicalization. Stable IDs, types, and references
+    are safely comparable and return ``False`` on a real mismatch.
+    """
+
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return None
+        current_parameter_id = expected.get("parameterId") or parameter_id
+        for key, expected_value in expected.items():
+            if key in _SKETCH_COMPARE_IGNORED:
+                continue
+            if key not in actual:
+                return None
+            compared = _compare_requested_sketch_entry(
+                expected_value,
+                actual[key],
+                field_name=key,
+                parameter_id=current_parameter_id,
+            )
+            if compared is not True:
+                return compared
+        return True
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return None
+        if field_name == "parameters":
+            actual_by_id = {
+                item.get("parameterId"): item
+                for item in actual
+                if isinstance(item, dict) and item.get("parameterId")
+            }
+            for item in expected:
+                if not isinstance(item, dict) or not item.get("parameterId"):
+                    return None
+                candidate = actual_by_id.get(item["parameterId"])
+                if candidate is None:
+                    return None
+                compared = _compare_requested_sketch_entry(item, candidate)
+                if compared is not True:
+                    return compared
+            return True
+        if len(expected) != len(actual):
+            return None
+        for expected_item, actual_item in zip(expected, actual):
+            compared = _compare_requested_sketch_entry(expected_item, actual_item)
+            if compared is not True:
+                return compared
+        return True
+    if _sketch_scalar_equal(expected, actual):
+        return True
+    if field_name in _SKETCH_STABLE_KEYS:
+        return False
+    if field_name == "value" and parameter_id in _REFERENCE_PARAMETER_IDS:
+        return False
+    return None
 
 
 def _merge(
@@ -315,6 +418,20 @@ async def edit_sketch(
 
     existing_entities = list(target.get("entities") or [])
     existing_constraints = list(target.get("constraints") or [])
+    existing_wire_ids = {
+        item_id
+        for item_id in (
+            [wire_entity_id(item) for item in existing_entities]
+            + [wire_entity_id(item) for item in existing_constraints]
+        )
+        if item_id
+    }
+    unknown_remove_ids = sorted(set(remove_ids) - existing_wire_ids)
+    if unknown_remove_ids:
+        raise ValueError(
+            "removeIds contains IDs that are not present in the current sketch: "
+            f"{unknown_remove_ids!r}"
+        )
 
     # Serialize user-facing specs into BTMSketch-151 wire shape BEFORE the
     # merge. Preserves the user's `id` as the wire-level entityId so the
@@ -377,7 +494,112 @@ async def edit_sketch(
         {"feature": merged_target},
         operation="update",
         feature_id=sketch_feature_id,
+        verify_requested_state=False,
     )
+
+    if apply_result.regen_ok is True:
+        reread = apply_result.raw.get("reread")
+        post_target = None
+        if isinstance(reread, dict):
+            post_target = next(
+                (
+                    feature
+                    for feature in reread.get("features") or []
+                    if isinstance(feature, dict)
+                    and feature.get("featureId") == sketch_feature_id
+                ),
+                None,
+            )
+
+        if post_target is None:
+            apply_result.ok = False
+            apply_result.mutation_verification = "unverified"
+            apply_result.changed = None
+            apply_result.verification_scope = "sketch_state"
+            apply_result.reason_code = "SKETCH_STATE_UNVERIFIED"
+            apply_result.verification_message = (
+                "The edited sketch could not be located in the authoritative reread."
+            )
+        else:
+            entities_after = {
+                wire_entity_id(item): item
+                for item in post_target.get("entities") or []
+                if wire_entity_id(item)
+            }
+            constraints_after = {
+                wire_entity_id(item): item
+                for item in post_target.get("constraints") or []
+                if wire_entity_id(item)
+            }
+            replacement_ids = {
+                item_id
+                for item_id in [
+                    *(wire_entity_id(item) for item in serialized_add_entities),
+                    *(wire_entity_id(item) for item in serialized_add_constraints),
+                ]
+                if item_id
+            }
+            removal_ids = (
+                set(remove_ids)
+                | {removal.constraint_id for removal in cascaded}
+            ) - replacement_ids
+            removal_ok = all(
+                item_id not in entities_after and item_id not in constraints_after
+                for item_id in removal_ids
+            )
+            comparisons: List[Optional[bool]] = []
+            for requested in serialized_add_entities:
+                item_id = wire_entity_id(requested)
+                actual = entities_after.get(item_id) if item_id else None
+                comparisons.append(
+                    False
+                    if actual is None
+                    else _compare_requested_sketch_entry(requested, actual)
+                )
+            for requested in serialized_add_constraints:
+                item_id = wire_entity_id(requested)
+                actual = constraints_after.get(item_id) if item_id else None
+                comparisons.append(
+                    None
+                    if not item_id
+                    else False
+                    if actual is None
+                    else _compare_requested_sketch_entry(requested, actual)
+                )
+
+            verified = removal_ok and all(
+                comparison is True for comparison in comparisons
+            )
+            stable_mismatch = not removal_ok or any(
+                comparison is False for comparison in comparisons
+            )
+            apply_result.ok = verified
+            apply_result.mutation_verification = (
+                "verified"
+                if verified
+                else "failed"
+                if stable_mismatch
+                else "unverified"
+            )
+            apply_result.changed = True if verified else None
+            apply_result.verification_scope = "sketch_state"
+            apply_result.reason_code = (
+                "REQUESTED_SKETCH_STATE_VERIFIED"
+                if verified
+                else "REQUESTED_SKETCH_STATE_MISMATCH"
+                if stable_mismatch
+                else "REQUESTED_SKETCH_STATE_UNVERIFIED"
+            )
+            apply_result.verification_message = (
+                "Requested sketch removals and serialized additions match the reread."
+                if verified
+                else "A stable sketch ID, type, reference, or removal does not match the request."
+                if stable_mismatch
+                else "Sketch membership or safely comparable requested fields could not be verified."
+            )
+            apply_result.error_message = (
+                None if apply_result.ok else apply_result.verification_message
+            )
 
     # Recompute removed_entity_ids from the diff for the bookkeeping
     # field so the caller sees exactly what disappeared (mirrors what

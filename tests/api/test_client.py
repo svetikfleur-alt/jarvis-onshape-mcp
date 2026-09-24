@@ -146,6 +146,44 @@ class TestOnshapeClient:
         assert "private-path-canary" not in message
         assert "private-query-canary" not in message
 
+    @pytest.mark.asyncio
+    async def test_http_diagnostic_redacts_unknown_route_and_body_tokens(
+        self, mock_credentials
+    ):
+        """Structured diagnostics must not surface unknown path or body values."""
+
+        class ErrorTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(
+                    400,
+                    request=request,
+                    text=(
+                        "BTPrivateCanaryException through reference chain: "
+                        'BTFeatureDefinitionCall["private-field-canary"])'
+                    ),
+                )
+
+        client = OnshapeClient(mock_credentials, transport=ErrorTransport())
+
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            await client.post(
+                "/api/v9/assemblies/private-assembly-canary/bom",
+                data={"private-body-canary": True},
+            )
+        await client.close()
+
+        diagnostic = caught.value.onshape_diagnostic
+        assert diagnostic["route"] == "/api/v9/assemblies/{opaque}/bom"
+        assert diagnostic["category"] is None
+        for poison in (
+            "private-assembly-canary",
+            "private-body-canary",
+            "PrivateCanary",
+            "private-field-canary",
+        ):
+            assert poison not in str(diagnostic)
+            assert poison not in str(caught.value)
+
     def test_get_auth_header_encoding(self, mock_credentials):
         """Test Basic Auth header generation."""
         client = OnshapeClient(mock_credentials)

@@ -13,7 +13,8 @@ in the parent project (`/Users/shef/projects/onshape-mcp/`).
 
 from __future__ import annotations
 
-import json
+import copy
+import math
 from typing import Any, Dict, List, Literal, Optional
 
 from loguru import logger
@@ -24,13 +25,14 @@ from .request_guard import safe_exception_message
 
 
 FeatureStatus = Literal["OK", "INFO", "WARNING", "ERROR", "UNKNOWN"]
+MutationVerification = Literal["verified", "unverified", "no_effect", "failed"]
 
 
 class FeatureApplyResult(BaseModel):
     """Structured result of applying (create/update) a feature.
 
-    `ok` is True iff `status == "OK"`. For WARNING, the feature built but
-    Onshape has a concern worth surfacing; `error_message` will carry it.
+    `ok` is True only when transport, regeneration, and requested-state
+    verification all succeeded. HTTP acceptance alone is not CAD success.
 
     `changes` (when set) is a git-diff-style summary of what the feature
     altered in the part — volume delta, faces added/removed, bbox change,
@@ -44,7 +46,170 @@ class FeatureApplyResult(BaseModel):
     feature_type: str
     error_message: Optional[str] = None
     changes: Optional[Dict[str, Any]] = None
-    raw: Dict[str, Any] = Field(default_factory=dict)
+    transport_ok: Optional[bool] = None
+    http_ok: Optional[bool] = None
+    regen_ok: Optional[bool] = None
+    mutation_verification: MutationVerification = "unverified"
+    changed: Optional[bool] = None
+    verification_scope: str = "none"
+    reason_code: Optional[str] = None
+    verification_message: Optional[str] = None
+    # Structured HTTP diagnostics cross the MCP boundary only through the
+    # dedicated sanitized exception projection, never as an arbitrary dict.
+    diagnostic: Optional[Dict[str, Any]] = Field(
+        default=None, exclude=True, repr=False
+    )
+    # Compatibility/evidence field for internal callers only. Pydantic's
+    # exclusion is a second boundary behind the explicit MCP projection.
+    raw: Dict[str, Any] = Field(default_factory=dict, exclude=True, repr=False)
+
+    def public_dict(self) -> Dict[str, Any]:
+        """Bounded allowlisted representation safe for MCP mutation results."""
+
+        return {
+            "ok": self.ok,
+            "status": self.status,
+            "feature_id": self.feature_id,
+            "feature_type": self.feature_type,
+            "feature_name": self.feature_name,
+            "error_message": self.error_message,
+            "transport_ok": self.transport_ok,
+            "http_ok": self.http_ok,
+            "regen_ok": self.regen_ok,
+            "mutation_verification": self.mutation_verification,
+            "changed": self.changed,
+            "verification_scope": self.verification_scope,
+            "reason_code": self.reason_code,
+            "verification_message": self.verification_message,
+        }
+
+
+def _normalize_status(raw_status: Any) -> FeatureStatus:
+    return (
+        raw_status
+        if raw_status in ("OK", "INFO", "WARNING", "ERROR")
+        else "UNKNOWN"
+    )
+
+
+def _regen_ok(status: FeatureStatus) -> bool:
+    return status in ("OK", "INFO")
+
+
+def _find_feature(features_doc: Dict[str, Any], feature_id: str) -> Optional[Dict[str, Any]]:
+    for feature in features_doc.get("features") or []:
+        if isinstance(feature, dict) and feature.get("featureId") == feature_id:
+            return feature
+    return None
+
+
+def _feature_state(features_doc: Dict[str, Any], feature_id: str) -> Dict[str, Any]:
+    state = (features_doc.get("featureStates") or {}).get(feature_id)
+    return state if isinstance(state, dict) else {}
+
+
+def _scalar_equal(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected is actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return math.isclose(float(expected), float(actual), rel_tol=1e-9, abs_tol=1e-12)
+    if isinstance(expected, str) and isinstance(actual, str):
+        return expected.strip() == actual.strip()
+    return expected == actual
+
+
+def _requested_subset_compare(
+    expected: Any,
+    actual: Any,
+    *,
+    field_name: Optional[str] = None,
+    parent_bt_type: Optional[str] = None,
+) -> Optional[bool]:
+    """Compare requested wire fields without requiring server-added metadata.
+
+    ``None`` means the response omitted/re-shaped a requested field, so exact
+    comparison would overclaim in the presence of Onshape canonicalization.
+    """
+
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict):
+            return None
+        current_bt_type = (
+            expected.get("btType")
+            if isinstance(expected.get("btType"), str)
+            else parent_bt_type
+        )
+        for key, expected_value in expected.items():
+            if key in {"featureId", "nodeId"}:
+                continue
+            if key not in actual:
+                return None
+            compared = _requested_subset_compare(
+                expected_value,
+                actual[key],
+                field_name=key,
+                parent_bt_type=current_bt_type,
+            )
+            if compared is not True:
+                return compared
+        return True
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return None
+        if expected and all(isinstance(item, dict) and item.get("parameterId") for item in expected):
+            by_id = {
+                item.get("parameterId"): item
+                for item in actual
+                if isinstance(item, dict) and item.get("parameterId")
+            }
+            for item in expected:
+                candidate = by_id.get(item["parameterId"])
+                if candidate is None:
+                    return None
+                compared = _requested_subset_compare(
+                    item, candidate, parent_bt_type=parent_bt_type
+                )
+                if compared is not True:
+                    return compared
+            return True
+        if len(expected) != len(actual):
+            return None
+        for expected_item, actual_item in zip(expected, actual):
+            compared = _requested_subset_compare(
+                expected_item,
+                actual_item,
+                field_name=field_name,
+                parent_bt_type=parent_bt_type,
+            )
+            if compared is not True:
+                return compared
+        return True
+    if _scalar_equal(expected, actual):
+        return True
+    # Onshape may normalize equivalent expressions and query text on write.
+    # A textual mismatch in those fields is not evidence of an ineffective
+    # mutation unless an equivalence evaluator is available.
+    if field_name in {"expression", "queryString", "queryStatement"}:
+        return None
+    return False
+
+
+def _requested_update_compare(
+    update: Dict[str, Any], parameter: Dict[str, Any]
+) -> Optional[bool]:
+    for key, expected in update.items():
+        if key == "parameterId":
+            continue
+        if key not in parameter:
+            return None
+        if not _scalar_equal(expected, parameter[key]):
+            # Quantity expressions are frequently canonicalized into another
+            # equivalent representation. A mismatch is therefore ambiguous,
+            # while exact equality is safe to verify.
+            if key == "expression":
+                return None
+            return False
+    return True
 
 
 async def apply_feature_and_check(
@@ -57,6 +222,7 @@ async def apply_feature_and_check(
     operation: Literal["create", "update"] = "create",
     feature_id: Optional[str] = None,
     track_changes: bool = False,
+    verify_requested_state: bool = True,
 ) -> FeatureApplyResult:
     """Apply a feature to a Part Studio and return its Onshape-reported status.
 
@@ -117,45 +283,205 @@ async def apply_feature_and_check(
 
     response = await client.post(path, data=feature_payload)
 
-    # Primary source: top-level featureState in the POST response.
     state = response.get("featureState") if isinstance(response, dict) else None
     feature = response.get("feature", {}) if isinstance(response, dict) else {}
-
+    feature = feature if isinstance(feature, dict) else {}
     real_feature_id = feature.get("featureId") or feature_id or ""
     feature_name = feature.get("name", "")
-    # feature_type: BTMFeature-134 uses "featureType" (e.g. "extrude"); BTMSketch-151
-    # does not and is identified by btType.
     feature_type = feature.get("featureType") or feature.get("btType", "")
+    status = _normalize_status((state or {}).get("featureStatus", "UNKNOWN"))
 
-    if not state:
-        # Fallback: re-fetch /features and pull from top-level featureStates map.
-        logger.warning(
-            "apply_feature_and_check: POST response missing featureState; "
-            "falling back to /features featureStates map"
+    # A regeneration failure is conclusive without a reread: transport worked,
+    # but the requested CAD state did not build.
+    if not _regen_ok(status) and status != "UNKNOWN":
+        fs_status = (
+            await _fetch_feature_status_enum(
+                client, document_id, workspace_id, element_id, real_feature_id
+            )
+            if real_feature_id
+            else None
         )
-        try:
-            feats = await client.get(base)
-            state = (feats.get("featureStates") or {}).get(real_feature_id)
-        except Exception as e:  # noqa: BLE001
-            logger.error("Fallback /features GET failed: {}", safe_exception_message(e))
-            state = None
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id=real_feature_id,
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message=_extract_error_message(state or {}, fs_status=fs_status),
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=False,
+            mutation_verification="failed",
+            changed=False,
+            verification_scope="feature_state",
+            reason_code="FEATURE_REGENERATION_ERROR",
+            verification_message="Onshape reported a non-success regeneration status.",
+            raw={"response": response if isinstance(response, dict) else {}},
+        )
 
-    raw_status: str = (state or {}).get("featureStatus", "UNKNOWN")
-    status: FeatureStatus = (
-        raw_status if raw_status in ("OK", "INFO", "WARNING", "ERROR") else "UNKNOWN"
-    )
-    # INFO means Onshape auto-adjusted something (e.g. extrude depth clamped to
-    # through-all), but the feature built correctly and downstream geometry is
-    # valid. Treat it as success; error_message still gets populated below so
-    # Claude can learn from the note.
-    ok = status in ("OK", "INFO")
+    try:
+        features_after = await client.get(base)
+    except Exception as error:  # noqa: BLE001
+        logger.warning(
+            "apply_feature_and_check: authoritative feature reread failed ({})",
+            type(error).__name__,
+        )
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id=real_feature_id,
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message="Mutation transport succeeded, but the resulting feature could not be reread.",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=(
+                True
+                if _regen_ok(status)
+                else False
+                if status != "UNKNOWN"
+                else None
+            ),
+            mutation_verification="unverified",
+            changed=None,
+            verification_scope="feature_state",
+            reason_code="AUTHORITATIVE_REREAD_FAILED",
+            verification_message="Requested state could not be verified by authoritative reread.",
+            raw={"response": response if isinstance(response, dict) else {}},
+        )
 
-    error_message: Optional[str] = None
-    if status != "OK":
+    if not real_feature_id:
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id="",
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message=(
+                "Mutation transport succeeded, but Onshape did not return an "
+                "identifier that can be correlated with the authoritative reread."
+            ),
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=None,
+            mutation_verification="unverified",
+            changed=None,
+            verification_scope="feature_state",
+            reason_code="FEATURE_ID_UNAVAILABLE",
+            verification_message=(
+                "Requested state cannot be verified without a stable feature identifier."
+            ),
+            raw={"response": response, "reread": features_after},
+        )
+
+    actual_feature = _find_feature(features_after, real_feature_id)
+    authoritative_state = _feature_state(features_after, real_feature_id)
+    if authoritative_state:
+        state = authoritative_state
+        status = _normalize_status(authoritative_state.get("featureStatus"))
+    else:
+        state = {}
+        status = "UNKNOWN"
+
+    if actual_feature:
+        feature_name = actual_feature.get("name") or feature_name
+        feature_type = (
+            actual_feature.get("featureType")
+            or actual_feature.get("btType")
+            or feature_type
+        )
+
+    if status != "UNKNOWN" and not _regen_ok(status):
         fs_status = await _fetch_feature_status_enum(
             client, document_id, workspace_id, element_id, real_feature_id
         )
-        error_message = _extract_error_message(state or {}, fs_status=fs_status)
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id=real_feature_id,
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message=_extract_error_message(state or {}, fs_status=fs_status),
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=False,
+            mutation_verification="failed",
+            changed=False,
+            verification_scope="feature_state",
+            reason_code="FEATURE_REGENERATION_ERROR",
+            verification_message="Authoritative reread reported a non-success regeneration status.",
+            raw={"response": response, "reread": features_after},
+        )
+
+    if actual_feature is None:
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id=real_feature_id,
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message="Mutation was accepted, but the target feature is absent on reread.",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=True if _regen_ok(status) else None,
+            mutation_verification="no_effect",
+            changed=False,
+            verification_scope="feature_state",
+            reason_code="FEATURE_NOT_PRESENT_AFTER_MUTATION",
+            verification_message="The expected feature was not present after mutation.",
+            raw={"response": response, "reread": features_after},
+        )
+
+    if status == "UNKNOWN":
+        return FeatureApplyResult(
+            ok=False,
+            status="UNKNOWN",
+            feature_id=real_feature_id,
+            feature_name=feature_name,
+            feature_type=feature_type,
+            error_message=(
+                "The feature is present, but its authoritative regeneration "
+                "status was unavailable."
+            ),
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=None,
+            mutation_verification="unverified",
+            changed=None,
+            verification_scope="feature_state",
+            reason_code="FEATURE_STATUS_UNAVAILABLE",
+            verification_message=(
+                "Feature presence was confirmed, but regeneration success was not."
+            ),
+            raw={"response": response, "reread": features_after},
+        )
+
+    requested_feature = feature_payload.get("feature", feature_payload)
+    comparison: Optional[bool] = None
+    if verify_requested_state and isinstance(requested_feature, dict):
+        comparison = _requested_subset_compare(requested_feature, actual_feature)
+
+    if comparison is True:
+        verification: MutationVerification = "verified"
+        reason_code = "REQUESTED_STATE_VERIFIED"
+        verification_message = "Requested feature fields match the authoritative reread."
+        changed: Optional[bool] = True
+    elif comparison is False:
+        verification = "failed"
+        reason_code = "REQUESTED_STATE_MISMATCH"
+        verification_message = "Safely comparable requested feature fields do not match."
+        changed = True
+    else:
+        verification = "unverified"
+        reason_code = "REQUESTED_STATE_UNVERIFIED"
+        verification_message = (
+            "Feature presence and regeneration were confirmed, but requested fields "
+            "could not be compared defensibly."
+        )
+        changed = None
+
+    ok = verification == "verified"
+    error_message = None if ok else verification_message
 
     # After-snapshot + diff. Only if caller asked AND before-snapshot succeeded
     # AND the feature actually built (diffing after an ERROR would likely just
@@ -189,7 +515,15 @@ async def apply_feature_and_check(
         feature_type=feature_type,
         error_message=error_message,
         changes=changes,
-        raw=response if isinstance(response, dict) else {},
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=True,
+        mutation_verification=verification,
+        changed=changed,
+        verification_scope="feature_state",
+        reason_code=reason_code,
+        verification_message=verification_message,
+        raw={"response": response, "reread": features_after},
     )
 
 
@@ -251,10 +585,7 @@ async def apply_assembly_feature_and_check(
             logger.error("Fallback /features GET failed: {}", safe_exception_message(e))
             state = None
 
-    raw_status: str = (state or {}).get("featureStatus", "UNKNOWN")
-    status: FeatureStatus = (
-        raw_status if raw_status in ("OK", "INFO", "WARNING", "ERROR") else "UNKNOWN"
-    )
+    status = _normalize_status((state or {}).get("featureStatus", "UNKNOWN"))
     ok = status in ("OK", "INFO")
 
     error_message: Optional[str] = None
@@ -275,7 +606,16 @@ async def apply_assembly_feature_and_check(
         feature_name=feature_name,
         feature_type=feature_type,
         error_message=error_message,
-        raw=response if isinstance(response, dict) else {},
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=ok,
+        mutation_verification="verified" if ok else "failed",
+        changed=None,
+        verification_scope="response_feature_state",
+        reason_code=(
+            "RESPONSE_FEATURE_STATE_OK" if ok else "FEATURE_REGENERATION_ERROR"
+        ),
+        raw={"response": response if isinstance(response, dict) else {}},
     )
 
 
@@ -339,6 +679,8 @@ async def update_feature_params_and_check(
             f"Available ids: {[f.get('featureId') for f in features]}"
         )
 
+    before_target = copy.deepcopy(target)
+    target = copy.deepcopy(target)
     params = target.get("parameters") or []
     param_by_id: Dict[str, Dict[str, Any]] = {
         p.get("parameterId"): p for p in params if isinstance(p, dict)
@@ -377,7 +719,44 @@ async def update_feature_params_and_check(
             f"Feature has parameters: {existing}"
         )
 
-    return await apply_feature_and_check(
+    before_params = {
+        p.get("parameterId"): p
+        for p in (before_target.get("parameters") or [])
+        if isinstance(p, dict) and p.get("parameterId")
+    }
+    if all(
+        _requested_update_compare(update, before_params[update["parameterId"]]) is True
+        for update in updates
+    ):
+        state = _feature_state(features_doc, feature_id)
+        status = _normalize_status(state.get("featureStatus", "UNKNOWN"))
+        return FeatureApplyResult(
+            ok=False,
+            status=status,
+            feature_id=feature_id,
+            feature_name=before_target.get("name", ""),
+            feature_type=(
+                before_target.get("featureType") or before_target.get("btType", "")
+            ),
+            error_message="Requested parameter values were already present; no POST was sent.",
+            transport_ok=None,
+            http_ok=None,
+            regen_ok=(
+                True
+                if _regen_ok(status)
+                else False
+                if status != "UNKNOWN"
+                else None
+            ),
+            mutation_verification="no_effect",
+            changed=False,
+            verification_scope="requested_parameters",
+            reason_code="REQUESTED_STATE_ALREADY_PRESENT",
+            verification_message="The requested parameter state was already present.",
+            raw={"reread": features_doc},
+        )
+
+    result = await apply_feature_and_check(
         client,
         document_id,
         workspace_id,
@@ -385,6 +764,244 @@ async def update_feature_params_and_check(
         {"feature": target},
         operation="update",
         feature_id=feature_id,
+        verify_requested_state=False,
+    )
+
+    if result.regen_ok is not True:
+        return result
+    features_after = result.raw.get("reread")
+    if not isinstance(features_after, dict):
+        return result
+    after_target = _find_feature(features_after, feature_id)
+    if after_target is None:
+        return result
+    after_params = {
+        p.get("parameterId"): p
+        for p in (after_target.get("parameters") or [])
+        if isinstance(p, dict) and p.get("parameterId")
+    }
+
+    comparisons: List[Optional[bool]] = []
+    for update in updates:
+        after_param = after_params.get(update["parameterId"])
+        comparisons.append(
+            None
+            if after_param is None
+            else _requested_update_compare(update, after_param)
+        )
+
+    if all(value is True for value in comparisons):
+        result.ok = True
+        result.mutation_verification = "verified"
+        result.changed = True
+        result.verification_scope = "requested_parameters"
+        result.reason_code = "REQUESTED_STATE_VERIFIED"
+        result.verification_message = (
+            "All requested parameter fields match the authoritative reread."
+        )
+        result.error_message = None
+        return result
+
+    unchanged = True
+    for update in updates:
+        before_param = before_params[update["parameterId"]]
+        after_param = after_params.get(update["parameterId"])
+        if after_param is None:
+            unchanged = False
+            break
+        for key in update:
+            if key == "parameterId":
+                continue
+            if key not in before_param or key not in after_param:
+                unchanged = False
+                break
+            if not _scalar_equal(before_param[key], after_param[key]):
+                unchanged = False
+                break
+        if not unchanged:
+            break
+
+    result.ok = False
+    result.verification_scope = "requested_parameters"
+    if unchanged:
+        result.mutation_verification = "no_effect"
+        result.changed = False
+        result.reason_code = "REQUESTED_STATE_UNCHANGED"
+        result.verification_message = (
+            "Transport and regeneration succeeded, but requested parameters were unchanged."
+        )
+    elif any(value is False for value in comparisons):
+        result.mutation_verification = "failed"
+        result.changed = True
+        result.reason_code = "REQUESTED_STATE_MISMATCH"
+        result.verification_message = (
+            "Safely comparable requested parameter fields do not match the reread."
+        )
+    else:
+        result.mutation_verification = "unverified"
+        result.changed = None
+        result.reason_code = "REQUESTED_STATE_UNVERIFIED"
+        result.verification_message = (
+            "Post-write parameters could not be compared defensibly with every requested field."
+        )
+    result.error_message = result.verification_message
+    return result
+
+
+async def delete_partstudio_feature_and_check(
+    manager: Any,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    feature_id: str,
+    *,
+    features_before: Optional[Dict[str, Any]] = None,
+) -> FeatureApplyResult:
+    """Delete a Part Studio feature and verify absence on authoritative reread."""
+
+    if features_before is None:
+        features_before = await manager.get_features(
+            document_id, workspace_id, element_id
+        )
+    target = _find_feature(features_before, feature_id)
+    if target is None:
+        return FeatureApplyResult(
+            ok=False,
+            status="UNKNOWN",
+            feature_id=feature_id,
+            feature_name="",
+            feature_type="",
+            error_message="Feature was absent before deletion; no request was sent.",
+            transport_ok=None,
+            http_ok=None,
+            regen_ok=None,
+            mutation_verification="no_effect",
+            changed=False,
+            verification_scope="feature_absence",
+            reason_code="FEATURE_ALREADY_ABSENT",
+        )
+
+    before_error_ids = {
+        item_id
+        for item_id, state in (features_before.get("featureStates") or {}).items()
+        if isinstance(state, dict) and state.get("featureStatus") == "ERROR"
+    }
+    await manager.delete_feature(document_id, workspace_id, element_id, feature_id)
+    try:
+        features_after = await manager.get_features(
+            document_id, workspace_id, element_id
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.warning(
+            "delete_partstudio_feature_and_check: authoritative reread failed ({})",
+            type(error).__name__,
+        )
+        return FeatureApplyResult(
+            ok=False,
+            status="UNKNOWN",
+            feature_id=feature_id,
+            feature_name=target.get("name", ""),
+            feature_type=target.get("featureType") or target.get("btType", ""),
+            error_message="Deletion transport succeeded, but absence could not be verified.",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=None,
+            mutation_verification="unverified",
+            changed=None,
+            verification_scope="feature_absence",
+            reason_code="AUTHORITATIVE_REREAD_FAILED",
+        )
+
+    if _find_feature(features_after, feature_id) is not None:
+        retained_status = _normalize_status(
+            _feature_state(features_after, feature_id).get("featureStatus")
+        )
+        return FeatureApplyResult(
+            ok=False,
+            status=retained_status,
+            feature_id=feature_id,
+            feature_name=target.get("name", ""),
+            feature_type=target.get("featureType") or target.get("btType", ""),
+            error_message="Delete request was accepted, but the feature remains present.",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=(
+                True
+                if _regen_ok(retained_status)
+                else False
+                if retained_status != "UNKNOWN"
+                else None
+            ),
+            mutation_verification="no_effect",
+            changed=False,
+            verification_scope="feature_absence",
+            reason_code="FEATURE_RETAINED_AFTER_DELETE",
+            raw={"reread": features_after},
+        )
+
+    states_after = features_after.get("featureStates")
+    if not isinstance(states_after, dict):
+        return FeatureApplyResult(
+            ok=False,
+            status="UNKNOWN",
+            feature_id=feature_id,
+            feature_name=target.get("name", ""),
+            feature_type=target.get("featureType") or target.get("btType", ""),
+            error_message=(
+                "Feature absence was confirmed, but post-delete regeneration "
+                "status was unavailable."
+            ),
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=None,
+            mutation_verification="unverified",
+            changed=True,
+            verification_scope="feature_absence",
+            reason_code="REGENERATION_STATUS_UNAVAILABLE_AFTER_DELETE",
+            verification_message=(
+                "Deletion changed the feature list, but regeneration health is unverified."
+            ),
+            raw={"reread": features_after},
+        )
+
+    after_error_ids = {
+        item_id
+        for item_id, state in states_after.items()
+        if isinstance(state, dict) and state.get("featureStatus") == "ERROR"
+    }
+    if after_error_ids - before_error_ids:
+        return FeatureApplyResult(
+            ok=False,
+            status="ERROR",
+            feature_id=feature_id,
+            feature_name=target.get("name", ""),
+            feature_type=target.get("featureType") or target.get("btType", ""),
+            error_message="Feature was removed, but the reread contains new regeneration errors.",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=False,
+            mutation_verification="failed",
+            changed=True,
+            verification_scope="feature_absence",
+            reason_code="DELETE_TRIGGERED_REGENERATION_ERROR",
+            raw={"reread": features_after},
+        )
+
+    return FeatureApplyResult(
+        ok=True,
+        status="OK",
+        feature_id=feature_id,
+        feature_name=target.get("name", ""),
+        feature_type=target.get("featureType") or target.get("btType", ""),
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=True,
+        mutation_verification="verified",
+        changed=True,
+        verification_scope="feature_absence",
+        reason_code="FEATURE_ABSENCE_VERIFIED",
+        verification_message="Feature absence was confirmed by authoritative reread.",
+        raw={"reread": features_after},
     )
 
 
@@ -407,7 +1024,7 @@ def _extract_error_message(
       1. `fs_status.statusEnum` + `statusType` (new, always actionable)
       2. `state.message` (rarely populated in practice)
       3. `state.feedback[].{severity, message}` (rarely populated)
-      4. Raw JSON dump of `state` (last resort so callers see something)
+      4. Bounded status-only fallback (never a raw state dump)
     """
 
     parts: List[str] = []
@@ -439,8 +1056,8 @@ def _extract_error_message(
     if parts:
         return " | ".join(parts)
 
-    # Nothing structured -- dump raw state so callers aren't blind.
-    return json.dumps(state, default=str)
+    status = state.get("featureStatus") or "UNKNOWN"
+    return f"Onshape reported featureStatus={status} without a structured message."
 
 
 async def _fetch_feature_status_enum(

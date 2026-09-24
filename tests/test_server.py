@@ -6,7 +6,14 @@ import httpx
 from mcp.types import Tool, TextContent
 
 # Import the server module components
-from onshape_mcp.server import list_tools, call_tool, _extract_offsets
+from onshape_mcp.server import (
+    _exception_json,
+    _extract_offsets,
+    _feature_apply_json,
+    call_tool,
+    list_tools,
+)
+from onshape_mcp.api.client import OnshapeHTTPError
 from onshape_mcp.api.variables import Variable
 from onshape_mcp.api.documents import DocumentInfo, ElementInfo
 
@@ -172,6 +179,7 @@ def _mock_apply_result(
     feature_name: str = "Sketch",
     feature_type: str = "newSketch",
     error_message=None,
+    raw=None,
 ):
     """Build a FeatureApplyResult for use as a mock return value."""
     from onshape_mcp.api.feature_apply import FeatureApplyResult
@@ -183,8 +191,137 @@ def _mock_apply_result(
         feature_name=feature_name,
         feature_type=feature_type,
         error_message=error_message,
-        raw={},
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=ok,
+        mutation_verification="verified" if ok else "failed",
+        changed=True if ok else False,
+        verification_scope="feature_state",
+        reason_code="REQUESTED_STATE_VERIFIED" if ok else "FEATURE_REGENERATION_ERROR",
+        raw=raw or {},
     )
+
+
+def test_feature_apply_json_never_serializes_internal_raw_poison():
+    """Private IDs and arbitrary raw response data cannot cross the MCP boundary."""
+    canaries = {
+        "documentId": "PRIVATE_DOCUMENT_CANARY",
+        "workspaceId": "PRIVATE_WORKSPACE_CANARY",
+        "elementId": "PRIVATE_ELEMENT_CANARY",
+        "arbitrary": "RAW_RESPONSE_CANARY",
+    }
+    rendered = _feature_apply_json(_mock_apply_result(raw=canaries))
+
+    assert "raw" not in rendered
+    for poison in canaries.values():
+        assert poison not in rendered
+
+
+def test_exception_json_uses_sanitized_http_diagnostic_not_raw_response():
+    private_doc = "PRIVATE_DOCUMENT_CANARY"
+    private_workspace = "PRIVATE_WORKSPACE_CANARY"
+    private_element = "PRIVATE_ELEMENT_CANARY"
+    raw_poison = "RAW_RESPONSE_CANARY"
+    route = "/api/v9/partstudios/d/{id}/w/{id}/e/{id}/features"
+    request = httpx.Request(
+        "POST",
+        "https://cad.onshape.com/api/v9/partstudios/d/hidden/w/hidden/e/hidden/features",
+    )
+    response = httpx.Response(400, request=request, text=raw_poison)
+    error = OnshapeHTTPError(
+        response,
+        {
+            "failure_kind": "http_rejection",
+            "method": "POST",
+            "route": route,
+            "status_code": 400,
+            "category": "BTWeirdStringValueException",
+            "reference_path": "feature.parameters[0]",
+            "message": "Onshape rejected the request payload.",
+        },
+    )
+
+    rendered = _exception_json(error, tool_name="create_extrude")
+    parsed = __import__("json").loads(rendered)
+
+    assert parsed["failure_kind"] == "http_rejection"
+    assert parsed["diagnostic"]["route"] == route
+    assert parsed["diagnostic"]["category"] == "BTWeirdStringValueException"
+    for poison in [private_doc, private_workspace, private_element, raw_poison]:
+        assert poison not in rendered
+
+
+@pytest.mark.asyncio
+@patch("onshape_mcp.server.custom_feature_manager")
+async def test_featurescript_mutation_serializer_uses_same_raw_poison_boundary(
+    mock_manager,
+):
+    poisons = {
+        "documentId": "PRIVATE_DOCUMENT_CANARY",
+        "workspaceId": "PRIVATE_WORKSPACE_CANARY",
+        "elementId": "PRIVATE_ELEMENT_CANARY",
+        "arbitrary": "RAW_RESPONSE_CANARY",
+    }
+    mock_manager.apply_featurescript_feature = AsyncMock(
+        return_value={
+            "apply_result": _mock_apply_result(raw=poisons),
+            "fs_element_id": "safe-fs-id",
+            "source_microversion_id": "safe-microversion",
+        }
+    )
+
+    result = await call_tool(
+        "write_featurescript_feature",
+        {
+            "documentId": "d",
+            "workspaceId": "w",
+            "elementId": "e",
+            "featureType": "customFeature",
+            "featureScript": "FeatureScript 3029;",
+            "featureName": "Custom",
+        },
+    )
+    rendered = result[0].text
+
+    assert "raw" not in rendered
+    for poison in poisons.values():
+        assert poison not in rendered
+
+
+@pytest.mark.asyncio
+@patch("onshape_mcp.api.sketch_edit.edit_sketch")
+async def test_sketch_mutation_serializer_uses_same_raw_poison_boundary(mock_edit):
+    poisons = {
+        "documentId": "PRIVATE_DOCUMENT_CANARY",
+        "workspaceId": "PRIVATE_WORKSPACE_CANARY",
+        "elementId": "PRIVATE_ELEMENT_CANARY",
+        "arbitrary": "RAW_RESPONSE_CANARY",
+    }
+    mock_edit.return_value = Mock(
+        apply=_mock_apply_result(raw=poisons),
+        added_entity_ids=["safe-point"],
+        added_constraint_ids=[],
+        removed_entity_ids=[],
+        removed_constraint_ids=[],
+        cascaded_removals=[],
+    )
+
+    result = await call_tool(
+        "edit_sketch",
+        {
+            "documentId": "d",
+            "workspaceId": "w",
+            "elementId": "e",
+            "sketchFeatureId": "sketch1",
+            "addEntities": [{"type": "point", "id": "safe-point", "at": [0, 0]}],
+        },
+    )
+    rendered = result[0].text
+
+    assert "raw" not in rendered
+    assert "mutation_verification" in rendered
+    for poison in poisons.values():
+        assert poison not in rendered
 
 
 class TestCreateSketchRectangle:
@@ -219,7 +356,10 @@ class TestCreateSketchRectangle:
         # _feature_apply_json now (status-based next-action pointers); drop
         # it from the equality check since its content rotates over time.
         parsed.pop("hints", None)
-        assert parsed == {
+        assert {key: parsed[key] for key in (
+            "ok", "status", "feature_id", "feature_type", "feature_name",
+            "error_message", "tool",
+        )} == {
             "ok": True,
             "status": "OK",
             "feature_id": "feature123",
@@ -228,6 +368,8 @@ class TestCreateSketchRectangle:
             "error_message": None,
             "tool": "create_sketch_rectangle",
         }
+        assert parsed["mutation_verification"] == "verified"
+        assert parsed["regen_ok"] is True
         mock_partstudio.get_plane_id.assert_called_once()
         mock_apply.assert_awaited_once()
 
@@ -1883,17 +2025,18 @@ class TestFeatureTools:
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.apply_feature_and_check")
-    async def test_create_revolve_success(self, mock_apply):
-        mock_apply.return_value = _mock_apply_result(
-            feature_id="rev123", feature_type="revolve"
-        )
+    async def test_create_revolve_rejects_unresolved_axis_payload_before_transport(
+        self, mock_apply
+    ):
         result = await call_tool("create_revolve", {
             "documentId": "d", "workspaceId": "w", "elementId": "e",
             "sketchFeatureId": "sketch1", "axis": "Y", "angle": 360,
         })
         import json as _json
         parsed = _json.loads(result[0].text)
-        assert parsed["ok"] is True and parsed["feature_id"] == "rev123"
+        assert parsed["ok"] is False
+        assert parsed["reason_code"] == "UNSUPPORTED_CURRENT_ONSHAPE_PAYLOAD"
+        mock_apply.assert_not_awaited()
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.apply_feature_and_check")
@@ -1948,6 +2091,13 @@ class TestFeatureTools:
         import json as _json
         parsed = _json.loads(result[0].text)
         assert parsed["ok"] is True and parsed["feature_id"] == "bool123"
+        payload = mock_apply.await_args[0][4]
+        feature = payload["feature"]
+        parameters = {item["parameterId"]: item for item in feature["parameters"]}
+        assert feature["featureType"] == "booleanBodies"
+        assert parameters["operationType"]["value"] == "UNION"
+        assert parameters["tools"]["queries"][0]["deterministicIds"] == ["b1", "b2"]
+        assert "targets" not in parameters
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.apply_feature_and_check")
@@ -1969,6 +2119,12 @@ class TestDeleteFeature:
     @patch("onshape_mcp.server.partstudio_manager")
     async def test_delete_feature_partstudio_success(self, mock_ps):
         mock_ps.delete_feature = AsyncMock(return_value={})
+        mock_ps.get_features = AsyncMock(
+            side_effect=[
+                {"features": [{"featureId": "toDelete", "name": "Old"}]},
+                {"features": [], "featureStates": {}},
+            ]
+        )
         result = await call_tool("delete_feature", {
             "documentId": "d", "workspaceId": "w", "elementId": "e",
             "featureId": "toDelete",
@@ -1980,6 +2136,8 @@ class TestDeleteFeature:
         assert parsed["feature_id"] == "toDelete"
         assert parsed["feature_type"] == "partstudio"
         assert parsed["tool"] == "delete_feature"
+        assert parsed["mutation_verification"] == "verified"
+        assert parsed["changed"] is True
         mock_ps.delete_feature.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1992,9 +2150,40 @@ class TestDeleteFeature:
         })
         import json as _json
         parsed = _json.loads(result[0].text)
-        assert parsed["ok"] is True
+        assert parsed["ok"] is False
         assert parsed["feature_type"] == "assembly"
+        assert parsed["mutation_verification"] == "unverified"
         mock_asm.delete_feature.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("onshape_mcp.server.partstudio_manager")
+    async def test_delete_feature_retained_is_no_effect(self, mock_ps):
+        retained = {"featureId": "toDelete", "name": "Old"}
+        mock_ps.get_features = AsyncMock(
+            side_effect=[
+                {"features": [retained]},
+                {
+                    "features": [retained],
+                    "featureStates": {"toDelete": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        mock_ps.delete_feature = AsyncMock(return_value={})
+
+        result = await call_tool(
+            "delete_feature",
+            {
+                "documentId": "d",
+                "workspaceId": "w",
+                "elementId": "e",
+                "featureId": "toDelete",
+            },
+        )
+        parsed = __import__("json").loads(result[0].text)
+
+        assert parsed["ok"] is False
+        assert parsed["mutation_verification"] == "no_effect"
+        assert parsed["changed"] is False
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.partstudio_manager")
@@ -2004,6 +2193,9 @@ class TestDeleteFeature:
         mock_response.text = "Feature not found"
         mock_ps.delete_feature = AsyncMock(
             side_effect=httpx.HTTPStatusError("Not Found", request=Mock(), response=mock_response)
+        )
+        mock_ps.get_features = AsyncMock(
+            return_value={"features": [{"featureId": "bogus"}], "featureStates": {}}
         )
         result = await call_tool("delete_feature", {
             "documentId": "d", "workspaceId": "w", "elementId": "e",
@@ -2022,12 +2214,16 @@ class TestDeleteFeatureByName:
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.partstudio_manager")
     async def test_delete_by_name_success(self, mock_ps):
-        mock_ps.get_features = AsyncMock(return_value={
+        before = {
             "features": [
                 {"featureId": "a", "name": "Sketch 1", "featureType": "newSketch"},
                 {"featureId": "b", "name": "Extrude 10mm", "featureType": "extrude"},
             ],
-        })
+            "featureStates": {},
+        }
+        mock_ps.get_features = AsyncMock(
+            side_effect=[before, {"features": [before["features"][0]], "featureStates": {}}]
+        )
         mock_ps.delete_feature = AsyncMock(return_value={})
 
         result = await call_tool("delete_feature_by_name", {
@@ -2040,6 +2236,7 @@ class TestDeleteFeatureByName:
         assert parsed["feature_id"] == "b"
         assert parsed["feature_name"] == "Extrude 10mm"
         assert parsed["feature_type"] == "extrude"
+        assert parsed["mutation_verification"] == "verified"
         mock_ps.delete_feature.assert_awaited_once()
         # Deleted the right id, not a lookalike.
         call = mock_ps.delete_feature.await_args

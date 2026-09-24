@@ -36,7 +36,6 @@ def test_literal_offset_and_flip_are_encoded_for_onshape():
         "expression": "0.25 in",
         "parameterId": "offset",
         "parameterName": "",
-        "libraryRelationType": "NONE",
     }
     assert _parameter(payload, "oppositeDirection")["value"] is True
 

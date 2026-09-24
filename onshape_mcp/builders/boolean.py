@@ -8,8 +8,8 @@ class BooleanType(Enum):
     """Boolean operation type."""
 
     UNION = "UNION"
-    SUBTRACT = "SUBTRACT"
-    INTERSECT = "INTERSECT"
+    SUBTRACT = "SUBTRACTION"
+    INTERSECT = "INTERSECTION"
 
 
 class BooleanBuilder:
@@ -80,31 +80,33 @@ class BooleanBuilder:
                     "operations"
                 )
 
+        tool_ids = list(self.tool_body_queries)
+        if self.boolean_type in (BooleanType.UNION, BooleanType.INTERSECT):
+            tool_ids.extend(self.target_body_queries)
+
         parameters: List[Dict[str, Any]] = [
             {
                 "btType": "BTMParameterEnum-145",
                 "namespace": "",
                 "enumName": "BooleanOperationType",
                 "value": self.boolean_type.value,
-                "parameterId": "booleanOperationType",
+                "parameterId": "operationType",
                 "parameterName": "",
-                "libraryRelationType": "NONE",
             },
             {
                 "btType": "BTMParameterQueryList-148",
                 "queries": [
                     {
                         "btType": "BTMIndividualQuery-138",
-                        "deterministicIds": self.tool_body_queries,
+                        "deterministicIds": tool_ids,
                     }
                 ],
                 "parameterId": "tools",
                 "parameterName": "",
-                "libraryRelationType": "NONE",
             },
         ]
 
-        if self.target_body_queries:
+        if self.boolean_type == BooleanType.SUBTRACT:
             parameters.append(
                 {
                     "btType": "BTMParameterQueryList-148",
@@ -116,7 +118,6 @@ class BooleanBuilder:
                     ],
                     "parameterId": "targets",
                     "parameterName": "",
-                    "libraryRelationType": "NONE",
                 }
             )
 
@@ -124,7 +125,7 @@ class BooleanBuilder:
             "btType": "BTFeatureDefinitionCall-1406",
             "feature": {
                 "btType": "BTMFeature-134",
-                "featureType": "boolean",
+                "featureType": "booleanBodies",
                 "name": self.name,
                 "suppressed": False,
                 "namespace": "",

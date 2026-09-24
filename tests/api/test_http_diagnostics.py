@@ -189,6 +189,7 @@ async def test_public_variable_studio_handler_omits_poison_response_body():
 @pytest.mark.asyncio
 async def test_public_custom_feature_handler_omits_poison_response_body():
     client = Mock()
+    client.get = AsyncMock(return_value=[{"name": "2931.0"}])
     client.post = AsyncMock(return_value={"raw": PRIVATE_BODY, PRIVATE_DOCUMENT_ID: "x"})
 
     with patch("onshape_mcp.server.custom_feature_manager", CustomFeatureManager(client)):
@@ -199,7 +200,10 @@ async def test_public_custom_feature_handler_omits_poison_response_body():
                 "workspaceId": PRIVATE_WORKSPACE_ID,
                 "elementId": PRIVATE_ELEMENT_ID,
                 "featureType": "safeFeature",
-                "featureScript": "annotation {} export const safeFeature = defineFeature(function() {});",
+                "featureScript": (
+                    "FeatureScript 2931; annotation {} "
+                    "export const safeFeature = defineFeature(function() {});"
+                ),
                 "featureName": "Safe name",
             },
         )
@@ -208,6 +212,38 @@ async def test_public_custom_feature_handler_omits_poison_response_body():
     assert payload["status"] == "EXCEPTION"
     assert "Feature Studio creation returned no id" in payload["error_message"]
     _assert_no_poison(payload)
+
+
+@pytest.mark.asyncio
+async def test_featurescript_discovery_error_log_omits_traceback_locals():
+    events: list[str] = []
+    sink_id = logger.add(events.append, format="{message}")
+    client = Mock()
+    client.get = AsyncMock(side_effect=_request_error())
+
+    try:
+        with patch(
+            "onshape_mcp.server.custom_feature_manager",
+            CustomFeatureManager(client),
+        ):
+            result = await call_tool(
+                "write_featurescript_feature",
+                {
+                    "documentId": PRIVATE_DOCUMENT_ID,
+                    "workspaceId": PRIVATE_WORKSPACE_ID,
+                    "elementId": PRIVATE_ELEMENT_ID,
+                    "featureType": "safeFeature",
+                    "featureScript": f"FeatureScript 2931; // {PRIVATE_BODY}",
+                    "featureName": "Safe name",
+                },
+            )
+    finally:
+        logger.remove(sink_id)
+
+    payload = json.loads(result[0].text)
+    assert payload["reason_code"] == "FEATURESCRIPT_VERSION_DISCOVERY_FAILED"
+    _assert_no_poison(payload)
+    _assert_no_poison("".join(events))
 
 
 @pytest.mark.asyncio
@@ -261,6 +297,11 @@ def test_exception_json_sanitizes_request_error_without_losing_safe_context():
 
     assert payload["status"] == "EXCEPTION"
     assert payload["tool"] == "test_tool"
+    assert payload["transport_ok"] is False
+    assert payload["http_ok"] is None
+    assert payload["mutation_verification"] == "unverified"
+    assert payload["changed"] is None
+    assert payload["failure_kind"] == "transport_failure"
     assert "ConnectError" in payload["error_message"]
     assert "GET" in payload["error_message"]
     assert "cad.onshape.com" in payload["error_message"]
@@ -453,7 +494,9 @@ async def test_feature_apply_best_effort_http_error_log_is_sanitized():
     finally:
         logger.remove(sink_id)
 
-    assert result.ok is True
+    assert result.ok is False
+    assert result.mutation_verification == "unverified"
+    assert result.reason_code == "AUTHORITATIVE_REREAD_FAILED"
     output = "".join(events)
     assert "ConnectError" in output
     assert "/api/v9/documents/d/{documentId}" in output

@@ -4,6 +4,12 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 
+class UnsupportedOnshapePayloadError(ValueError):
+    """Raised when repository evidence proves a payload path is unsafe."""
+
+    reason_code = "UNSUPPORTED_CURRENT_ONSHAPE_PAYLOAD"
+
+
 class RevolveType(Enum):
     """Revolve operation type."""
 
@@ -116,7 +122,6 @@ class RevolveBuilder:
             ],
             "parameterId": "axis",
             "parameterName": "",
-            "libraryRelationType": "NONE",
         }
 
     def build(self) -> Dict[str, Any]:
@@ -130,6 +135,12 @@ class RevolveBuilder:
         """
         if not self.sketch_feature_id:
             raise ValueError("Sketch feature ID must be set before building revolve")
+
+        raise UnsupportedOnshapePayloadError(
+            "Native revolve with an X/Y/Z datum axis is disabled: the existing "
+            "plane-edge query is accepted by transport but regenerates ERROR, and "
+            "the current replacement axis payload is not established offline."
+        )
 
         angle_expression = (
             f"#{self.angle_variable}" if self.angle_variable else f"{self.angle} deg"
@@ -161,7 +172,6 @@ class RevolveBuilder:
                         ],
                         "parameterId": "entities",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     self._build_axis_query(),
                     {
@@ -171,7 +181,6 @@ class RevolveBuilder:
                         "value": self.operation_type.value,
                         "parameterId": "operationType",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     {
                         "btType": "BTMParameterQuantity-147",
@@ -181,14 +190,12 @@ class RevolveBuilder:
                         "expression": angle_expression,
                         "parameterId": "revolveAngle",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                     {
                         "btType": "BTMParameterBoolean-144",
                         "value": self.opposite_direction,
                         "parameterId": "oppositeDirection",
                         "parameterName": "",
-                        "libraryRelationType": "NONE",
                     },
                 ],
             },

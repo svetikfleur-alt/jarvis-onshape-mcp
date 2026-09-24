@@ -46,6 +46,14 @@ def _apply_result(*, ok: bool = True) -> FeatureApplyResult:
     )
 
 
+def _manager_after_version_discovery(client: _RecordingClient) -> CustomFeatureManager:
+    """Build a manager for tests aimed below the version-preflight boundary."""
+
+    manager = CustomFeatureManager(client)
+    manager._std_version_cache = "2931"
+    return manager
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("versions", "expected"),
@@ -325,7 +333,7 @@ async def test_apply_featurescript_feature_uses_matching_spec_and_default_elemen
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     expected = _apply_result()
     captured: dict[str, Any] = {}
 
@@ -387,7 +395,7 @@ async def test_apply_featurescript_feature_falls_back_to_upload_microversion(
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     captured: dict[str, Any] = {}
 
     async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
@@ -418,7 +426,7 @@ async def test_apply_featurescript_feature_rejects_empty_compiled_specs():
         post_results=[{"id": "synthetic-fs"}, {}],
         get_results=[{"featureSpecs": []}],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
 
     with pytest.raises(RuntimeError, match="compiled to an empty feature spec"):
         await manager.apply_featurescript_feature(
@@ -446,7 +454,7 @@ async def test_failed_apply_is_enriched_with_featurescript_notices(monkeypatch):
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     failed = _apply_result(ok=False)
     captured: dict[str, Any] = {}
 
@@ -467,7 +475,7 @@ async def test_failed_apply_is_enriched_with_featurescript_notices(monkeypatch):
         "workspace",
         "part-studio",
         feature_type="syntheticFeature",
-        feature_script="synthetic source",
+        feature_script="FeatureScript 2931;\nsynthetic source",
         feature_name="Synthetic feature",
     )
 
@@ -501,7 +509,7 @@ async def test_failed_apply_without_extractable_body_preserves_original_error(
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     failed = _apply_result(ok=False)
 
     async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
@@ -516,7 +524,7 @@ async def test_failed_apply_without_extractable_body_preserves_original_error(
         "workspace",
         "part-studio",
         feature_type="syntheticFeature",
-        feature_script="not a defineFeature",
+        feature_script="FeatureScript 2931;\nnot a defineFeature",
         feature_name="Synthetic feature",
     )
 
@@ -540,7 +548,7 @@ async def test_failed_apply_with_no_renderable_notices_omits_empty_notice_header
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     failed = _apply_result(ok=False)
 
     async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
@@ -562,7 +570,7 @@ async def test_failed_apply_with_no_renderable_notices_omits_empty_notice_header
         "workspace",
         "part-studio",
         feature_type="syntheticFeature",
-        feature_script="synthetic source",
+        feature_script="FeatureScript 2931;\nsynthetic source",
         feature_name="Synthetic feature",
     )
 
@@ -584,7 +592,7 @@ async def test_notice_enrichment_failure_preserves_original_apply_diagnostic(mon
             }
         ],
     )
-    manager = CustomFeatureManager(client)
+    manager = _manager_after_version_discovery(client)
     failed = _apply_result(ok=False)
 
     async def fake_instantiate(*args: Any, **kwargs: Any) -> FeatureApplyResult:
@@ -604,7 +612,7 @@ async def test_notice_enrichment_failure_preserves_original_apply_diagnostic(mon
         "workspace",
         "part-studio",
         feature_type="syntheticFeature",
-        feature_script="synthetic source",
+        feature_script="FeatureScript 2931;\nsynthetic source",
         feature_name="Synthetic feature",
     )
 
