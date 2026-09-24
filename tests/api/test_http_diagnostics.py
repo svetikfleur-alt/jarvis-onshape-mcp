@@ -33,14 +33,14 @@ PRIVATE_QUERY = "private-query-canary"
 PRIVATE_BODY = "private-response-body-canary"
 
 
-def _status_error() -> httpx.HTTPStatusError:
+def _status_error(status_code: int = 403) -> httpx.HTTPStatusError:
     request = httpx.Request(
         "GET",
         f"https://cad.onshape.com/api/v9/documents/d/{PRIVATE_DOCUMENT_ID}"
         f"?token={PRIVATE_QUERY}",
     )
     response = httpx.Response(
-        403,
+        status_code,
         request=request,
         headers={"Content-Length": str(len(PRIVATE_BODY))},
         text=PRIVATE_BODY,
@@ -307,6 +307,44 @@ def test_exception_json_sanitizes_request_error_without_losing_safe_context():
     assert "cad.onshape.com" in payload["error_message"]
     assert "/api/v9/documents/d/{documentId}" in payload["error_message"]
     _assert_no_poison(payload)
+
+
+def test_exception_json_marks_definitive_http_rejection_failed():
+    payload = json.loads(_exception_json(_status_error(), tool_name="test_tool"))
+
+    assert payload["transport_ok"] is True
+    assert payload["http_ok"] is False
+    assert payload["mutation_verification"] == "failed"
+    assert payload["changed"] is False
+    assert payload["failure_kind"] == "http_rejection"
+    _assert_no_poison(payload)
+
+
+def test_exception_json_keeps_server_failure_unverified():
+    payload = json.loads(_exception_json(_status_error(503), tool_name="test_tool"))
+
+    assert payload["transport_ok"] is True
+    assert payload["http_ok"] is False
+    assert payload["mutation_verification"] == "unverified"
+    assert payload["changed"] is None
+    assert payload["failure_kind"] == "http_rejection"
+    _assert_no_poison(payload)
+
+
+def test_exception_json_marks_explicit_local_validation_rejection_failed():
+    payload = json.loads(
+        _exception_json(
+            ValueError("unknown parameterId"),
+            tool_name="update_feature",
+            request_rejected=True,
+        )
+    )
+
+    assert payload["transport_ok"] is None
+    assert payload["http_ok"] is None
+    assert payload["mutation_verification"] == "failed"
+    assert payload["changed"] is False
+    assert payload["failure_kind"] == "local_failure"
 
 
 @pytest.mark.asyncio
