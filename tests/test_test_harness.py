@@ -438,6 +438,14 @@ def test_unrelated_marker_name_does_not_count_as_positive_live_selection(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _configure_subprocess(pytester, monkeypatch)
+    pytester.makeini(
+        """
+[pytest]
+addopts = --strict-markers
+markers =
+    live_onshape_shadow: synthetic non-live marker for exact-name selection
+"""
+    )
     _enable_readonly_live(monkeypatch)
     pytester.makepyfile(
         """
