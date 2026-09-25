@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 import time
 
@@ -39,18 +38,20 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from dotenv import load_dotenv
+from onshape_mcp.runtime import load_runtime_environment  # noqa: E402
 
-# Look for .env in parent dir (project root) first, then the repo.
-load_dotenv(REPO.parent.parent / ".env")
-load_dotenv(REPO / ".env")
+load_runtime_environment()
 
 from onshape_mcp import server as S  # noqa: E402
-from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials  # noqa: E402
+from onshape_mcp.api.client import OnshapeClient, resolve_onshape_credentials  # noqa: E402
 from onshape_mcp.api.describe import DescribeManager  # noqa: E402
 from onshape_mcp.api.documents import DocumentManager  # noqa: E402
 from onshape_mcp.api.partstudio import PartStudioManager  # noqa: E402
 from onshape_mcp.api.rendering import get_image  # noqa: E402
+
+
+def _resolve_runtime_credentials():
+    return resolve_onshape_credentials()
 
 
 
@@ -224,13 +225,11 @@ class TestReport:
 
 
 async def run_cad_test(test: CadTest, out_root: Path) -> TestReport:
-    ak = os.getenv("ONSHAPE_API_KEY") or os.getenv("ONSHAPE_ACCESS_KEY", "")
-    sk = os.getenv("ONSHAPE_API_SECRET") or os.getenv("ONSHAPE_SECRET_KEY", "")
-    if not ak or not sk:
+    creds = _resolve_runtime_credentials()
+    if not creds.access_key or not creds.secret_key:
         raise RuntimeError(
-            "Onshape credentials not found. Set ONSHAPE_API_KEY/ONSHAPE_API_SECRET."
+            "Onshape credentials not found. Configure one complete supported alias pair."
         )
-    creds = OnshapeCredentials(access_key=ak, secret_key=sk)
     ts = int(time.time())
     out_dir = out_root / f"{test.name}-{ts}"
     results: List[StepResult] = []

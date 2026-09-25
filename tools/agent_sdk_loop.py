@@ -7,7 +7,7 @@ Desktop / API always goes through MCP transport, so tests that skip
 it are lying about the integration surface.
 
 This harness:
-  1. Launches `uv run onshape-mcp` as a stdio MCP subprocess.
+  1. Launches the checkout-pinned `uv run --frozen onshape-mcp` stdio runtime.
   2. Connects Claude to it via the Claude Agent SDK.
   3. Uses the user's existing Claude Code CLI credentials — no
      ANTHROPIC_API_KEY required.
@@ -41,7 +41,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
-SKILL_PATH = REPO.parent.parent / "SKILL.md"
+SKILL_PATH = REPO / "skills" / "onshape" / "SKILL.md"
+DEFAULT_OUTPUT_ROOT = REPO / "scratchpad" / "agent-sdk-runs"
 
 
 def _load_skill_md() -> str:
@@ -64,7 +65,7 @@ async def run(brief: str, out_dir: Path, *, max_turns: int = 40) -> dict:
     except ImportError as e:
         raise RuntimeError(
             "claude-agent-sdk not installed. Run: "
-            "cd references/hedless-onshape-mcp && uv add claude-agent-sdk"
+            "run `uv sync --frozen` in the Jarvis repository"
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -116,7 +117,7 @@ async def run(brief: str, out_dir: Path, *, max_turns: int = 40) -> dict:
                 "command": "uv",
                 "args": [
                     "--directory", str(REPO),
-                    "run", "onshape-mcp",
+                    "run", "--frozen", "onshape-mcp",
                 ],
                 **({"env": mcp_env} if mcp_env else {}),
             }
@@ -234,7 +235,7 @@ def _cli() -> int:
     p.add_argument("--max-turns", type=int, default=40)
     p.add_argument(
         "--out",
-        default=str(REPO.parent.parent / "scratchpad" / "agent-sdk-runs"),
+        default=str(DEFAULT_OUTPUT_ROOT),
     )
     args = p.parse_args()
     ts = int(time.time())

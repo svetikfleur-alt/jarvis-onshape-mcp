@@ -20,6 +20,10 @@ _SAFE_ERROR_CATEGORIES = frozenset({"BTWeirdStringValueException"})
 _SAFE_REFERENCE_FIELDS = frozenset(
     {"definition", "entities", "feature", "message", "parameters", "queries"}
 )
+ONSHAPE_CREDENTIAL_ENV_PAIRS = (
+    ("ONSHAPE_ACCESS_KEY", "ONSHAPE_SECRET_KEY"),
+    ("ONSHAPE_API_KEY", "ONSHAPE_API_SECRET"),
+)
 
 
 def _diagnostic_route(method: str, path: str) -> str:
@@ -107,15 +111,51 @@ def resolve_onshape_credentials(
     """Resolve one complete supported credential pair without cross-pair mixing."""
 
     source = os.environ if environment is None else environment
-    for access_name, secret_name in (
-        ("ONSHAPE_ACCESS_KEY", "ONSHAPE_SECRET_KEY"),
-        ("ONSHAPE_API_KEY", "ONSHAPE_API_SECRET"),
-    ):
+    for access_name, secret_name in ONSHAPE_CREDENTIAL_ENV_PAIRS:
         access_key = (source.get(access_name) or "").strip()
         secret_key = (source.get(secret_name) or "").strip()
         if access_key and secret_key:
             return OnshapeCredentials(access_key=access_key, secret_key=secret_key)
     return OnshapeCredentials(access_key="", secret_key="")
+
+
+def describe_onshape_credential_configuration(
+    environment: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Describe credential presence without returning or logging credential values."""
+
+    source = os.environ if environment is None else environment
+    complete_aliases: list[str] = []
+    any_component_present = False
+    incomplete_alias_present = False
+
+    for access_name, secret_name in ONSHAPE_CREDENTIAL_ENV_PAIRS:
+        access_present = bool((source.get(access_name) or "").strip())
+        secret_present = bool((source.get(secret_name) or "").strip())
+        any_component_present = any_component_present or access_present or secret_present
+        if access_present and secret_present:
+            complete_aliases.append(f"{access_name} + {secret_name}")
+        elif access_present or secret_present:
+            incomplete_alias_present = True
+
+    if complete_aliases:
+        status = "present"
+    elif any_component_present:
+        status = "incomplete"
+    else:
+        status = "missing"
+
+    warnings = []
+    if incomplete_alias_present:
+        warnings.append("incomplete_alias_pair")
+    if len(complete_aliases) > 1:
+        warnings.append("multiple_complete_alias_pairs")
+
+    return {
+        "status": status,
+        "selected_alias": complete_aliases[0] if complete_aliases else None,
+        "warnings": warnings,
+    }
 
 
 class OnshapeClient:

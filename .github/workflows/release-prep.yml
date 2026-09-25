@@ -74,17 +74,15 @@ jobs:
             f.write(content)
         "
 
-    - name: Bump version in __init__.py
+    - name: Bump version in plugin manifest
       run: |
         python -c "
-        with open('onshape_mcp/__init__.py', 'r') as f:
-            content = f.read()
-        content = content.replace(
-            '__version__ = \"${{ steps.version.outputs.current }}\"',
-            '__version__ = \"${{ steps.version.outputs.new }}\"'
-        )
-        with open('onshape_mcp/__init__.py', 'w') as f:
-            f.write(content)
+        import json
+        from pathlib import Path
+        path = Path('.claude-plugin/plugin.json')
+        plugin = json.loads(path.read_text(encoding='utf-8'))
+        plugin['version'] = '${{ steps.version.outputs.new }}'
+        path.write_text(json.dumps(plugin, indent=2) + '\n', encoding='utf-8')
         "
 
     - name: Generate changelog entry
@@ -103,7 +101,7 @@ jobs:
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add pyproject.toml onshape_mcp/__init__.py
+        git add pyproject.toml .claude-plugin/plugin.json
         git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
 
     - name: Push release branch

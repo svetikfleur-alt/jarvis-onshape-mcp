@@ -6,7 +6,7 @@
     "name": "Reshef Elisha",
     "url": "https://github.com/ReshefElisha"
   },
-  "repository": "https://github.com/ReshefElisha/jarvis-onshape-mcp",
+  "repository": "https://github.com/svetikfleur-alt/jarvis-onshape-mcp",
   "license": "MIT",
   "keywords": [
     "jarvis",
@@ -27,6 +27,7 @@
         "--directory",
         "${CLAUDE_PLUGIN_ROOT}",
         "run",
+        "--frozen",
         "onshape-mcp"
       ]
     }

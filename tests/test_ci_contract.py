@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import re
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_REPOSITORY = "https://github.com/svetikfleur-alt/jarvis-onshape-mcp"
+CANONICAL_PLUGIN_ARGS = [
+    "--directory",
+    "${CLAUDE_PLUGIN_ROOT}",
+    "run",
+    "--frozen",
+    "onshape-mcp",
+]
 
 
 def _read(relative_path: str) -> str:
@@ -32,10 +41,76 @@ def test_pytest_defaults_are_fast_and_pyproject_owns_coverage_policy() -> None:
 def test_plugin_defers_credentials_to_the_runtime_environment() -> None:
     plugin = json.loads(_read(".claude-plugin/plugin.json"))
     server = plugin["mcpServers"]["onshape"]
+    project = tomllib.loads(_read("pyproject.toml"))["project"]
 
     assert "userConfig" not in plugin
     assert "env" not in server
     assert server["command"] == "uv"
+    assert server["args"] == CANONICAL_PLUGIN_ARGS
+    assert plugin["repository"] == CANONICAL_REPOSITORY
+    assert plugin["version"] == project["version"]
+
+
+def test_canonical_runtime_documentation_uses_portable_checkout_placeholder() -> None:
+    readme = _read("README.md")
+
+    assert "uv --directory <repo-root> run --frozen onshape-mcp" in readme
+    assert (
+        "codex mcp add jarvis-onshape -- uv --directory $jarvisRoot "
+        "run --frozen onshape-mcp"
+    ) in readme
+    assert "<repo-root>" in readme
+    assert f"github:{CANONICAL_REPOSITORY.removeprefix('https://github.com/')}" in readme
+    assert f"git clone {CANONICAL_REPOSITORY}.git" in readme
+    assert "github:ReshefElisha/jarvis-onshape-mcp" not in readme
+    assert "git clone https://github.com/ReshefElisha/jarvis-onshape-mcp" not in readme
+    assert "Codex CLI, IDE extension, ChatGPT Desktop, or Claude Code" in readme
+    assert "restart Claude Code and try" not in readme
+
+
+def test_env_example_contains_only_blank_supported_alias_assignments() -> None:
+    lines = _read(".env.example").splitlines()
+
+    assert lines == [
+        "ONSHAPE_ACCESS_KEY=",
+        "ONSHAPE_SECRET_KEY=",
+        "ONSHAPE_API_KEY=",
+        "ONSHAPE_API_SECRET=",
+    ]
+
+
+def test_generated_runtime_state_is_ignored_without_hiding_env_template() -> None:
+    ignored = (
+        ".env",
+        ".codex/config.toml",
+        "graphify-out/graph.json",
+        ".pytest_cache/state",
+        ".pytest-tmp/session",
+        ".ruff_cache/state",
+        ".mypy_cache/state",
+    )
+    for path in ignored:
+        result = subprocess.run(
+            ["git", "check-ignore", "--no-index", "--quiet", "--", path],
+            cwd=ROOT,
+            check=False,
+        )
+        assert result.returncode == 0, path
+
+    template = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", "--", ".env.example"],
+        cwd=ROOT,
+        check=False,
+    )
+    assert template.returncode == 1
+
+
+def test_release_workflow_updates_package_and_plugin_metadata_only() -> None:
+    workflow = _read(".github/workflows/release-prep.yml")
+
+    assert "pyproject.toml" in workflow
+    assert ".claude-plugin/plugin.json" in workflow
+    assert "onshape_mcp/__init__.py" not in workflow
 
 
 def test_pr_workflow_is_one_blocking_credential_free_python_312_job() -> None:

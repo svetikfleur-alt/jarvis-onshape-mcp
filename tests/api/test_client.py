@@ -86,6 +86,59 @@ class TestOnshapeCredentials:
 
         assert (credentials.access_key, credentials.secret_key) == expected
 
+    @pytest.mark.parametrize(
+        ("environment", "expected_status", "expected_alias", "expected_warnings"),
+        [
+            ({}, "missing", None, []),
+            (
+                {"ONSHAPE_ACCESS_KEY": "access-canary"},
+                "incomplete",
+                None,
+                ["incomplete_alias_pair"],
+            ),
+            (
+                {
+                    "ONSHAPE_API_KEY": "api-canary",
+                    "ONSHAPE_API_SECRET": "api-secret-canary",
+                },
+                "present",
+                "ONSHAPE_API_KEY + ONSHAPE_API_SECRET",
+                [],
+            ),
+            (
+                {
+                    "ONSHAPE_ACCESS_KEY": "access-canary",
+                    "ONSHAPE_SECRET_KEY": "secret-canary",
+                    "ONSHAPE_API_KEY": "api-canary",
+                    "ONSHAPE_API_SECRET": "api-secret-canary",
+                },
+                "present",
+                "ONSHAPE_ACCESS_KEY + ONSHAPE_SECRET_KEY",
+                ["multiple_complete_alias_pairs"],
+            ),
+        ],
+    )
+    def test_runtime_credential_status_is_structural_and_never_exposes_values(
+        self,
+        environment,
+        expected_status,
+        expected_alias,
+        expected_warnings,
+    ):
+        describe = getattr(client_api, "describe_onshape_credential_configuration", None)
+        assert callable(describe), "non-secret credential diagnostic is missing"
+
+        diagnostic = describe(environment)
+
+        assert diagnostic == {
+            "status": expected_status,
+            "selected_alias": expected_alias,
+            "warnings": expected_warnings,
+        }
+        rendered = str(diagnostic)
+        for value in environment.values():
+            assert value not in rendered
+
 
 class TestOnshapeClient:
     """Test OnshapeClient HTTP operations."""

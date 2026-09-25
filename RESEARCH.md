@@ -180,7 +180,7 @@ CAD scores, because the conclusions are different.
 ## Reproduce
 
 ```
-git clone https://github.com/ReshefElisha/jarvis-onshape-mcp
+git clone https://github.com/svetikfleur-alt/jarvis-onshape-mcp.git
 cd jarvis-onshape-mcp
 git checkout autoresearch    # eval harness lives here
 python3.11 -m venv eval/.venv && source eval/.venv/bin/activate

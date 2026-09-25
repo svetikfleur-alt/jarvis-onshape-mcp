@@ -7,16 +7,15 @@ import base64
 import json
 from typing import Any, Optional
 import httpx
-from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 from loguru import logger
 
-# Load environment variables from .env file before local imports read them.
-# Look for .env in the package directory (where this server.py lives).
-_package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(_package_dir, ".env"))
+# Load the one canonical repository-root .env before local imports read it.
+from .runtime import get_runtime_info, load_runtime_environment
+
+load_runtime_environment()
 
 from .api.client import OnshapeClient, resolve_onshape_credentials
 from .api.request_guard import (
@@ -147,6 +146,7 @@ list_entities, or from create_offset_plane).
 - update_feature — patch params on an existing feature (iteration)
 
 ### Introspection (USE OFTEN)
+- get_runtime_info — non-secret package/source/Python/credential-presence diagnostic; never calls Onshape
 - start_model_context / get_feature_tree_compact / find_features / inspect_feature — bounded cached feature intelligence
 - inspect_feature_dependencies / get_dependency_slice / update_working_state / get_context_status — local dependency navigation and working state
 - describe_part_studio — topology + multi-view renders in one call. First stop after every mutation.
@@ -279,6 +279,19 @@ def _governance_context_not_found_content(
 async def list_tools() -> list[Tool]:
     """List available MCP tools."""
     return [
+        Tool(
+            name="get_runtime_info",
+            description=(
+                "Report the running Jarvis package version, resolved source path, Python "
+                "environment, credential presence state, and network/auth test state. "
+                "Never returns credential values and never calls the network."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
         Tool(
             name="create_sketch_rectangle",
             description=(
@@ -3384,7 +3397,15 @@ async def _create_mate(
 async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
-    if name == "create_sketch_rectangle":
+    if name == "get_runtime_info":
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(get_runtime_info(), indent=2, sort_keys=True),
+            )
+        ]
+
+    elif name == "create_sketch_rectangle":
         try:
             plane_id, plane, warnings = await _resolve_sketch_plane_id(arguments)
             sketch = SketchBuilder(
@@ -6480,21 +6501,26 @@ def create_sse_app():
 sse_app = create_sse_app()
 
 
-def main():
+def main(argv: Optional[list[str]] = None):
     """Main entry point - run stdio by default."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--runtime-info" in args:
+        print(json.dumps(get_runtime_info(), indent=2, sort_keys=True))
+        return
+
     # Check if we should run in SSE mode
-    if "--sse" in sys.argv or os.getenv("MCP_TRANSPORT") == "sse":
+    if "--sse" in args or os.getenv("MCP_TRANSPORT") == "sse":
         import uvicorn
 
         # Get port from args or env
         port = 3000
-        for i, arg in enumerate(sys.argv):
-            if arg == "--port" and i + 1 < len(sys.argv):
-                port = int(sys.argv[i + 1])
+        for i, arg in enumerate(args):
+            if arg == "--port" and i + 1 < len(args):
+                port = int(args[i + 1])
         port = int(os.getenv("MCP_PORT", port))
 
         # Check if reload is requested
-        reload = "--reload" in sys.argv or os.getenv("MCP_RELOAD") == "true"
+        reload = "--reload" in args or os.getenv("MCP_RELOAD") == "true"
 
         print(f"Starting Jarvis Onshape MCP server in SSE mode on port {port}", file=sys.stderr)
         if reload:

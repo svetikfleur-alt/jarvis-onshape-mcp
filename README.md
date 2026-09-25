@@ -53,10 +53,54 @@ benchmark data behind that workflow.
 - **Assembly.** Fastened, slider, revolute, cylindrical mates; face-coordinate
   systems; instance alignment; bounding-box interference checks.
 
-## Install
+## Install and launch
 
+Jarvis has one canonical stdio runtime: the `onshape-mcp` console script from
+this checkout, mapped by `pyproject.toml` to `onshape_mcp.server:main`. Replace
+`<repo-root>` with the absolute path to the checkout on the machine running the
+MCP client:
+
+```text
+uv --directory <repo-root> run --frozen onshape-mcp
 ```
-/plugin install github:ReshefElisha/jarvis-onshape-mcp
+
+Using both `--directory` and `--frozen` makes the checkout and lockfile
+explicit, preventing an older global installation or another worktree from
+being selected accidentally.
+
+Clone the canonical repository and prepare its locked environment with:
+
+```bash
+git clone https://github.com/svetikfleur-alt/jarvis-onshape-mcp.git
+cd jarvis-onshape-mcp
+uv sync --frozen
+```
+
+### Codex and ChatGPT Desktop
+
+Codex CLI, the IDE extension, and ChatGPT Desktop share Codex MCP
+configuration. From PowerShell, register the canonical runtime without putting
+credentials or a machine-specific path in this repository:
+
+```powershell
+$jarvisRoot = (Resolve-Path "<repo-root>").Path
+codex mcp add jarvis-onshape -- uv --directory $jarvisRoot run --frozen onshape-mcp
+codex mcp list
+```
+
+The equivalent machine-local `config.toml` entry uses `command = "uv"` and
+`args = ["--directory", "<absolute-repo-root>", "run", "--frozen",
+"onshape-mcp"]`. In ChatGPT Desktop, open **Settings → MCP servers**, confirm
+`jarvis-onshape`, and restart. See the official
+[Codex MCP documentation](https://developers.openai.com/codex/extend/mcp).
+
+### Claude plugin compatibility
+
+The existing Claude-compatible plugin manifest is retained and launches the
+same canonical command through `${CLAUDE_PLUGIN_ROOT}`:
+
+```text
+/plugin install github:svetikfleur-alt/jarvis-onshape-mcp
 ```
 
 Get a key pair at [dev-portal.onshape.com](https://dev-portal.onshape.com/),
@@ -66,8 +110,9 @@ MCP server:
 - `ONSHAPE_ACCESS_KEY` plus `ONSHAPE_SECRET_KEY`; or
 - `ONSHAPE_API_KEY` plus `ONSHAPE_API_SECRET`.
 
-When running from a checkout, the server also loads the same names from a
-`.env` file at the repository/package root. This repository does not implement
+The server loads the same names from exactly `<repo-root>/.env`; inherited
+process variables take precedence. Copy `.env.example` to `.env` and fill in
+exactly one pair locally. This repository does not implement
 or promise a Claude Code/Desktop credential prompt or OS-keychain flow; those
 are external-client behaviors. Missing, empty, and whitespace-only values fail
 locally before the first Onshape request. Non-empty credentials are not claimed
@@ -76,18 +121,18 @@ valid, unrevoked, or correctly scoped until Onshape accepts a request.
 ### Requirements
 
 - [uv](https://docs.astral.sh/uv/) on your PATH (`brew install uv` or the
-  official installer). The plugin launches its MCP server via `uv run`.
-- Claude Code desktop or CLI with plugin support.
+  official installer).
+- Codex CLI, IDE extension, ChatGPT Desktop, or Claude Code with plugin support.
 - An Onshape account.
 
 ## Quick start
 
-Once installed, restart Claude Code and try:
+Once configured, restart your MCP client and try:
 
 > "Create a new Onshape document, add a Part Studio, and build me a
 >  60×40×8 mm mounting plate with four ø4 mm holes 6 mm in from the corners."
 
-Claude will render the result, show you the bbox delta, and surface any
+The connected agent will render the result, show you the bbox delta, and surface any
 regen warnings. If it takes a wrong direction on an extrude, the
 `BOOLEAN_SUBTRACT_NO_OP` hint will kick in and it'll self-correct.
 
@@ -165,12 +210,40 @@ docs to read.
 ## Development
 
 ```
-git clone https://github.com/ReshefElisha/jarvis-onshape-mcp
-cd jarvis-onshape-mcp
-uv sync
-uv run onshape-mcp         # launch the MCP server on stdio
-uv run pytest -m "not live_onshape"  # credential-free offline tests
+uv sync --frozen
+uv run --frozen pytest -m "not live_onshape"  # credential-free offline tests
 ```
+
+### Runtime diagnostic
+
+Run the diagnostic through the same checkout-pinned command used by the MCP
+client:
+
+```text
+uv --directory <repo-root> run --frozen onshape-mcp --runtime-info
+```
+
+The JSON output reports package metadata, resolved server source, project root,
+Python executable/environment, the exact `.env` path, and only structural
+credential state (`missing`, `incomplete`, or `present`). It never returns
+credential values and never calls Onshape. The connected MCP server exposes
+the same implementation as `get_runtime_info`, allowing the actual running
+process to be checked for a stale install or wrong checkout.
+
+`server_status=initialized` proves local initialization. Credential state is
+separate from `network_auth_status=not_tested` and
+`live_authenticated_read_status=not_tested`: non-empty credentials remain
+unverified until an explicitly authorized read succeeds. The existing guarded
+read-only acceptance test is the next-step proof:
+
+```text
+python -m pytest tests/live/test_live_deep_read.py -m "live_onshape and live_readonly" -q --maxfail=1
+```
+
+Do not run that command without separate live-read authorization and the
+required `JARVIS_LIVE_*` identifiers. A passing run is the evidence that the
+live authenticated read succeeded; the runtime diagnostic intentionally does
+not persist or infer that result.
 
 ### Offline tests and local live acceptance
 

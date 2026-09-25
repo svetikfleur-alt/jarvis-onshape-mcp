@@ -29,9 +29,13 @@ ENV/
 # IDE
 .vscode/
 .idea/
+.codex/
 *.swp
 *.swo
 *~
+
+# Generated repository graph
+graphify-out/
 
 # Environment variables
 .env
@@ -51,6 +55,7 @@ Thumbs.db
 
 # Testing
 .pytest_cache/
+/.pytest-tmp/
 .coverage
 .coverage.*
 htmlcov/

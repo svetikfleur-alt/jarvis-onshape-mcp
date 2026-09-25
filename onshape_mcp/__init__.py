@@ -1,3 +1,9 @@
 """Enhanced MCP server for Onshape programmatic CAD modeling."""
 
-__version__ = "0.3.0"
+from importlib.metadata import PackageNotFoundError, version
+
+
+try:
+    __version__ = version("onshape-mcp")
+except PackageNotFoundError:
+    __version__ = "not_installed"

@@ -42,19 +42,24 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from dotenv import load_dotenv
-load_dotenv(REPO.parent.parent / ".env")
-load_dotenv(REPO / ".env")
+from onshape_mcp.runtime import load_runtime_environment  # noqa: E402
+
+load_runtime_environment()
 
 from loguru import logger  # noqa: E402
 
 from onshape_mcp import server as S  # noqa: E402
-from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials  # noqa: E402
+from onshape_mcp.api.client import OnshapeClient, resolve_onshape_credentials  # noqa: E402
 from onshape_mcp.api.documents import DocumentManager  # noqa: E402
 from onshape_mcp.api.partstudio import PartStudioManager  # noqa: E402
 
 
-SKILL_PATH = REPO.parent.parent / "SKILL.md"
+SKILL_PATH = REPO / "skills" / "onshape" / "SKILL.md"
+DEFAULT_OUTPUT_ROOT = REPO / "scratchpad" / "agent-runs"
+
+
+def _resolve_runtime_credentials():
+    return resolve_onshape_credentials()
 
 # Tools we want the agent to see. Deliberately a subset: focus on Part
 # Studio authoring + describe/measure + utilities; skip the assembly tools
@@ -178,9 +183,7 @@ async def run_agent(
             "anthropic SDK not installed. Run: uv add anthropic"
         )
 
-    ak = os.getenv("ONSHAPE_API_KEY") or os.getenv("ONSHAPE_ACCESS_KEY", "")
-    sk = os.getenv("ONSHAPE_API_SECRET") or os.getenv("ONSHAPE_SECRET_KEY", "")
-    creds = OnshapeCredentials(access_key=ak, secret_key=sk)
+    creds = _resolve_runtime_credentials()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "brief.txt").write_text(brief)
@@ -312,7 +315,7 @@ def _cli() -> int:
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument(
         "--out",
-        default=str(REPO.parent.parent / "scratchpad" / "agent-runs"),
+        default=str(DEFAULT_OUTPUT_ROOT),
         help="Directory root for per-run output",
     )
     args = parser.parse_args()
