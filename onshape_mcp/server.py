@@ -5,6 +5,7 @@ import sys
 import asyncio
 import base64
 import json
+from datetime import datetime, timezone
 from typing import Any, Optional
 import httpx
 from mcp.server import Server
@@ -1040,8 +1041,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "isPublic": {
                         "type": "boolean",
-                        "description": "Whether the document should be public",
-                        "default": False,
+                        "description": (
+                            "Optional explicit public/private override. When omitted, Jarvis "
+                            "checks authenticated session information: confirmed Free plans "
+                            "create public documents, while unknown plans preserve omission."
+                        ),
                     },
                 },
                 "required": ["name"],
@@ -4698,15 +4702,152 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     elif name == "create_document":
         try:
-            doc = await document_manager.create_document(
-                name=arguments["name"],
-                description=arguments.get("description"),
-                is_public=arguments.get("isPublic", False),
-            )
+            is_public = arguments.get("isPublic")
+            if "isPublic" not in arguments:
+                try:
+                    plan_group = await document_manager.get_account_plan_group()
+                except Exception as error:  # noqa: BLE001
+                    _log_unexpected_error(
+                        "create_document: account plan resolution failed",
+                        error,
+                    )
+                else:
+                    if isinstance(plan_group, str) and plan_group.casefold() == "free":
+                        is_public = True
+
+            attempted_at = datetime.now(timezone.utc)
+            try:
+                doc = await document_manager.create_document(
+                    name=arguments["name"],
+                    description=arguments.get("description"),
+                    is_public=is_public,
+                )
+            except httpx.ReadTimeout as timeout_error:
+                reconciled_doc = None
+                try:
+                    reconciled_doc = await document_manager.reconcile_created_document(
+                        arguments["name"],
+                        attempted_at=attempted_at,
+                        expected_public=is_public,
+                    )
+                except Exception as reconciliation_error:  # noqa: BLE001
+                    _log_unexpected_error(
+                        "create_document: timeout reconciliation failed",
+                        reconciliation_error,
+                    )
+
+                if reconciled_doc is None:
+                    return [
+                        TextContent(
+                            type="text",
+                            text=_exception_json(
+                                timeout_error,
+                                tool_name="create_document",
+                                hints=[
+                                    "The create POST timed out after transmission and was not "
+                                    "retried. Bounded exact-name reconciliation did not prove "
+                                    "one newly created document.",
+                                    "The mutation remains unverified; inspect authoritative "
+                                    "documents before issuing another create request.",
+                                ],
+                            ),
+                        )
+                    ]
+
+                safe_timeout = safe_http_diagnostic(timeout_error)
+                payload = {
+                    "ok": True,
+                    "document_id": reconciled_doc.id,
+                    "document_name": reconciled_doc.name,
+                    "document_public": reconciled_doc.public,
+                    "workspace_id": None,
+                    "part_studio_id": None,
+                    "part_studio_name": None,
+                    "tool": "create_document",
+                    "mutation_verification": "verified",
+                    "reconciled": True,
+                    "transport_diagnostic": {
+                        "failure_kind": "transport_failure",
+                        "error_class": safe_timeout.error_class,
+                        "method": safe_timeout.method,
+                        "route": safe_timeout.route,
+                        "status_code": safe_timeout.status_code,
+                        "message": (
+                            "The create request timed out before its result was known."
+                        ),
+                    },
+                }
+                return [TextContent(type="text", text=json.dumps(payload))]
 
             workspace_id: Optional[str] = None
             part_studio_id: Optional[str] = None
             part_studio_name: Optional[str] = None
+            try:
+                authoritative_doc = await document_manager.get_document(doc.id)
+            except Exception as reread_error:  # noqa: BLE001
+                _log_unexpected_error(
+                    "create_document: authoritative document reread failed",
+                    reread_error,
+                )
+                failure = json.loads(
+                    _exception_json(
+                        reread_error,
+                        tool_name="create_document",
+                        hints=[
+                            "The create POST returned, but the created document could not be "
+                            "authoritatively reread. Do not assume the mutation failed or "
+                            "blindly repeat the create request."
+                        ],
+                    )
+                )
+                failure.update(
+                    {
+                        "document_id": doc.id,
+                        "document_name": doc.name,
+                        "mutation_verification": "unverified",
+                        "changed": None,
+                        "verification_scope": "document",
+                        "reason_code": "CREATE_DOCUMENT_REREAD_FAILED",
+                    }
+                )
+                return [TextContent(type="text", text=json.dumps(failure))]
+
+            reread_matches = (
+                authoritative_doc.id == doc.id
+                and authoritative_doc.name == arguments["name"]
+                and (
+                    is_public is None
+                    or authoritative_doc.public is is_public
+                )
+            )
+            if not reread_matches:
+                failure = {
+                    "ok": False,
+                    "status": "ERROR",
+                    "document_id": doc.id,
+                    "document_name": authoritative_doc.name,
+                    "document_public": authoritative_doc.public,
+                    "workspace_id": workspace_id,
+                    "part_studio_id": part_studio_id,
+                    "part_studio_name": part_studio_name,
+                    "tool": "create_document",
+                    "transport_ok": True,
+                    "http_ok": True,
+                    "regen_ok": None,
+                    "mutation_verification": "failed",
+                    "changed": True,
+                    "verification_scope": "document",
+                    "failure_kind": "authoritative_mismatch",
+                    "reason_code": "CREATE_DOCUMENT_REREAD_MISMATCH",
+                    "error_message": (
+                        "The authoritative document reread contradicted the requested "
+                        "document identity or visibility."
+                    ),
+                }
+                return [TextContent(type="text", text=json.dumps(failure))]
+
+            doc = authoritative_doc
+
             try:
                 workspaces = await document_manager.get_workspaces(doc.id)
                 # WorkspaceInfo uses `is_main` as the Python field name
@@ -4731,10 +4872,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 "ok": True,
                 "document_id": doc.id,
                 "document_name": doc.name,
+                "document_public": doc.public,
                 "workspace_id": workspace_id,
                 "part_studio_id": part_studio_id,
                 "part_studio_name": part_studio_name,
                 "tool": "create_document",
+                "mutation_verification": "verified",
+                "reconciled": False,
             }
             return [TextContent(type="text", text=json.dumps(payload))]
         except httpx.HTTPStatusError as e:
@@ -4742,7 +4886,18 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             return [
                 TextContent(
                     type="text",
-                    text=f"Error creating document: API returned {e.response.status_code}. Check your API credentials and permissions.",
+                    text=_exception_json(
+                        e,
+                        tool_name="create_document",
+                        status_code=e.response.status_code,
+                        hints=[
+                            "HTTP 409 means Onshape rejected the requested document-creation "
+                            "state; it does not by itself establish invalid credentials. Omit "
+                            "optional ownership/publicity fields unless they are intentional.",
+                            "HTTP 403 can indicate missing write scope or account permission; "
+                            "authenticated reads alone do not prove write permission.",
+                        ],
+                    ),
                 )
             ]
         except Exception as e:
@@ -4750,7 +4905,15 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             return [
                 TextContent(
                     type="text",
-                    text=f"Error creating document: {_safe_exception_message(e)}",
+                    text=_exception_json(
+                        e,
+                        tool_name="create_document",
+                        hints=[
+                            "Document creation did not reach an authoritatively verified state.",
+                            "Inspect the structured failure kind before retrying; do not infer "
+                            "a credential failure from an unrelated local or transport error.",
+                        ],
+                    ),
                 )
             ]
 

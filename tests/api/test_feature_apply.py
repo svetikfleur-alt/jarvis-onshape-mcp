@@ -5,6 +5,7 @@ tests/real/test_feature_apply_real.py; these tests pin the
 param-merge behavior of the update helper without hitting Onshape.
 """
 
+import copy
 from unittest.mock import AsyncMock
 
 import httpx
@@ -541,7 +542,7 @@ class TestPartStudioMutationTruth:
         assert result.reason_code == "REQUESTED_STATE_UNVERIFIED"
 
     @pytest.mark.asyncio
-    async def test_create_canonicalized_quantity_expression_is_unverified(
+    async def test_create_canonicalized_quantity_expression_is_verified_by_value(
         self, onshape_client
     ):
         requested = _extrude_feature(feature_id="", depth_expr="10 mm")
@@ -564,10 +565,121 @@ class TestPartStudioMutationTruth:
             onshape_client, "d", "w", "e", {"feature": requested}
         )
 
-        assert result.ok is False
+        assert result.ok is True
         assert result.regen_ok is True
-        assert result.mutation_verification == "unverified"
-        assert result.reason_code == "REQUESTED_STATE_UNVERIFIED"
+        assert result.mutation_verification == "verified"
+        assert result.reason_code == "REQUESTED_STATE_VERIFIED"
+
+    @pytest.mark.asyncio
+    async def test_create_canonicalized_query_text_is_verified_by_feature_reference(
+        self, onshape_client
+    ):
+        requested = _extrude_feature(feature_id="")
+        requested.pop("featureId")
+        requested["parameters"].append(
+            {
+                "btType": "BTMParameterQueryList-148",
+                "parameterId": "entities",
+                "queries": [
+                    {
+                        "btType": "BTMIndividualSketchRegionQuery-140",
+                        "queryStatement": None,
+                        "queryString": 'query = qSketchRegion(id + "sketch-1", true);',
+                        "featureId": "sketch-1",
+                        "filterInnerLoops": True,
+                        "deterministicIds": [],
+                    }
+                ],
+            }
+        )
+        actual = _extrude_feature(feature_id="created")
+        actual["parameters"].append(
+            {
+                "btType": "BTMParameterQueryList-148",
+                "parameterId": "entities",
+                "queries": [
+                    {
+                        "btType": "BTMIndividualSketchRegionQuery-140",
+                        "queryStatement": "qSketchRegion(sketch-1)",
+                        "queryString": "canonicalized by Onshape",
+                        "featureId": "sketch-1",
+                        "filterInnerLoops": True,
+                        "deterministicIds": [],
+                    }
+                ],
+            }
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": actual,
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+        onshape_client.get = AsyncMock(
+            return_value={
+                "features": [actual],
+                "featureStates": {"created": {"featureStatus": "OK"}},
+            }
+        )
+
+        result = await apply_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": requested}
+        )
+
+        assert result.ok is True
+        assert result.mutation_verification == "verified"
+        assert result.reason_code == "REQUESTED_STATE_VERIFIED"
+
+    @pytest.mark.asyncio
+    async def test_create_query_reference_mismatch_is_failed(
+        self, onshape_client
+    ):
+        requested = _extrude_feature(feature_id="")
+        requested.pop("featureId")
+        requested["parameters"].append(
+            {
+                "btType": "BTMParameterQueryList-148",
+                "parameterId": "entities",
+                "queries": [
+                    {
+                        "btType": "BTMIndividualSketchRegionQuery-140",
+                        "queryStatement": None,
+                        "queryString": 'query = qSketchRegion(id + "sketch-1", true);',
+                        "featureId": "sketch-1",
+                        "filterInnerLoops": True,
+                        "deterministicIds": [],
+                    }
+                ],
+            }
+        )
+        actual = copy.deepcopy(requested)
+        actual["featureId"] = "created"
+        entities = next(
+            parameter
+            for parameter in actual["parameters"]
+            if parameter["parameterId"] == "entities"
+        )
+        entities["queries"][0]["featureId"] = "different-sketch"
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": actual,
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+        onshape_client.get = AsyncMock(
+            return_value={
+                "features": [actual],
+                "featureStates": {"created": {"featureStatus": "OK"}},
+            }
+        )
+
+        result = await apply_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": requested}
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "failed"
+        assert result.reason_code == "REQUESTED_STATE_MISMATCH"
 
     @pytest.mark.asyncio
     async def test_regeneration_error_is_failed_even_when_http_succeeds(

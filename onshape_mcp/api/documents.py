@@ -1,9 +1,24 @@
 """Document management for Onshape projects and documents."""
 
-from typing import Any, Dict, List, Optional
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, cast
 from pydantic import BaseModel, Field
 from .client import OnshapeClient
+
+
+_PLAN_GROUP_UNSET = object()
+_CREATE_RECONCILIATION_ATTEMPTS = 2
+_CREATE_RECONCILIATION_DELAY_SECONDS = 1.0
+_CREATE_RECONCILIATION_SEARCH_LIMIT = 5
+_CREATE_RECONCILIATION_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize an Onshape timestamp for bounded reconciliation comparisons."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class DocumentInfo(BaseModel):
@@ -59,6 +74,28 @@ class DocumentManager:
             client: Onshape API client
         """
         self.client = client
+        self._plan_group_cache: object | Optional[str] = _PLAN_GROUP_UNSET
+
+    async def get_account_plan_group(self) -> Optional[str]:
+        """Return the authenticated account plan group, cached for this client.
+
+        The official session-info response may omit ``planGroup`` depending on
+        the caller's scope. A successful response without a usable value is
+        cached as unknown so document creation does not repeatedly spend reads.
+        Transport and HTTP failures remain retryable by a later tool call.
+        """
+        if self._plan_group_cache is not _PLAN_GROUP_UNSET:
+            return cast(Optional[str], self._plan_group_cache)
+
+        response = await self.client.get("/api/v17/users/sessioninfo")
+        raw_plan_group = response.get("planGroup")
+        plan_group = (
+            raw_plan_group.strip()
+            if isinstance(raw_plan_group, str) and raw_plan_group.strip()
+            else None
+        )
+        self._plan_group_cache = plan_group
+        return plan_group
 
     async def list_documents(
         self,
@@ -277,14 +314,18 @@ class DocumentManager:
         return elements
 
     async def create_document(
-        self, name: str, description: Optional[str] = None, is_public: bool = False
+        self,
+        name: str,
+        description: Optional[str] = None,
+        is_public: Optional[bool] = None,
     ) -> DocumentInfo:
         """Create a new Onshape document.
 
         Args:
             name: Name for the new document
             description: Optional description
-            is_public: Whether the document should be public
+            is_public: Explicit public/private override. When omitted, Onshape
+                applies the account's document-creation policy.
 
         Returns:
             DocumentInfo for the created document
@@ -292,7 +333,8 @@ class DocumentManager:
         data: Dict[str, Any] = {"name": name}
         if description is not None:
             data["description"] = description
-        data["isPublic"] = is_public
+        if is_public is not None:
+            data["isPublic"] = is_public
 
         response = await self.client.post("/api/v10/documents", data=data)
 
@@ -313,6 +355,51 @@ class DocumentManager:
             description=response.get("description"),
             thumbnail=thumbnail_url,
         )
+
+    async def reconcile_created_document(
+        self,
+        name: str,
+        *,
+        attempted_at: datetime,
+        expected_public: Optional[bool],
+    ) -> Optional[DocumentInfo]:
+        """Resolve one recent exact-name create after an ambiguous POST timeout.
+
+        Reconciliation is deliberately bounded to two narrow searches and one
+        authoritative document reread. It never repeats the create request.
+        """
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+        attempted_at = attempted_at.astimezone(timezone.utc)
+        earliest = attempted_at - _CREATE_RECONCILIATION_CLOCK_SKEW
+
+        for attempt in range(_CREATE_RECONCILIATION_ATTEMPTS):
+            candidates = await self.search_documents(
+                name,
+                limit=_CREATE_RECONCILIATION_SEARCH_LIMIT,
+            )
+            latest = datetime.now(timezone.utc) + _CREATE_RECONCILIATION_CLOCK_SKEW
+            exact_recent = [
+                document
+                for document in candidates
+                if document.name == name
+                and earliest <= _as_utc(document.created_at) <= latest
+            ]
+            if len(exact_recent) > 1:
+                return None
+            if len(exact_recent) == 1:
+                candidate = exact_recent[0]
+                reread = await self.get_document(candidate.id)
+                if reread.id != candidate.id or reread.name != name:
+                    return None
+                if not (earliest <= _as_utc(reread.created_at) <= latest):
+                    return None
+                if expected_public is not None and reread.public is not expected_public:
+                    return None
+                return reread
+            if attempt + 1 < _CREATE_RECONCILIATION_ATTEMPTS:
+                await asyncio.sleep(_CREATE_RECONCILIATION_DELAY_SECONDS)
+        return None
 
     async def delete_document(self, document_id: str) -> Dict[str, Any]:
         """Delete (trash) a document.

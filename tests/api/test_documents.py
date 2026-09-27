@@ -454,9 +454,8 @@ class TestDocumentManager:
         onshape_client.post.assert_called_once()
         call_args = onshape_client.post.call_args
         assert "/api/v10/documents" in call_args[0][0]
-        # Verify isPublic is always sent even when False
-        assert call_args[1]["data"]["isPublic"] is False
-        assert "description" not in call_args[1]["data"]
+        # Omitted policy fields let Onshape choose the valid account default.
+        assert call_args[1]["data"] == {"name": "New Document"}
 
     @pytest.mark.asyncio
     async def test_create_document_with_all_params(self, document_manager, onshape_client):
@@ -489,6 +488,32 @@ class TestDocumentManager:
         assert data["name"] == "Public Document"
         assert data["description"] == "A public document"
         assert data["isPublic"] is True
+
+    @pytest.mark.asyncio
+    async def test_create_document_forwards_explicit_private_override(
+        self, document_manager, onshape_client
+    ):
+        """An explicit private request remains distinct from omission."""
+        onshape_client.post = AsyncMock(
+            return_value={
+                "id": "new_doc_private",
+                "name": "Private Document",
+                "createdAt": "2024-01-01T00:00:00Z",
+                "modifiedAt": "2024-01-01T00:00:00Z",
+                "owner": {"id": "user1", "name": "Test User"},
+                "public": False,
+                "description": None,
+            }
+        )
+
+        await document_manager.create_document(
+            name="Private Document", is_public=False
+        )
+
+        assert onshape_client.post.await_args.kwargs["data"] == {
+            "name": "Private Document",
+            "isPublic": False,
+        }
 
     @pytest.mark.asyncio
     async def test_create_document_api_error(self, document_manager, onshape_client):

@@ -20,6 +20,7 @@ _ROOT_RESOURCES = frozenset(
         "parts",
         "partstudios",
         "translations",
+        "users",
     }
 )
 _STATIC_ROUTE_SEGMENTS = frozenset(
@@ -33,6 +34,7 @@ _STATIC_ROUTE_SEGMENTS = frozenset(
         "featurescript",
         "massproperties",
         "metadata",
+        "sessioninfo",
         "shadedviews",
         "tabs",
         "thumbnails",

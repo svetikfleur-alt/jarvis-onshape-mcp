@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from typing import Any, Dict, List, Literal, Optional
 
 from loguru import logger
@@ -26,6 +27,11 @@ from .request_guard import safe_exception_message
 
 FeatureStatus = Literal["OK", "INFO", "WARNING", "ERROR", "UNKNOWN"]
 MutationVerification = Literal["verified", "unverified", "no_effect", "failed"]
+
+
+_CONCRETE_QUANTITY_EXPRESSION = re.compile(
+    r"^\s*[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?\s+[^#\s]+\s*$"
+)
 
 
 class MutationPreflightError(ValueError):
@@ -129,6 +135,47 @@ def _scalar_equal(expected: Any, actual: Any) -> bool:
     return expected == actual
 
 
+def _quantity_value_proves_expression_equivalence(
+    expected: Dict[str, Any], actual: Dict[str, Any], bt_type: Optional[str]
+) -> bool:
+    """Use canonical numeric truth only for two concrete quantity literals."""
+    if not (isinstance(bt_type, str) and bt_type.startswith("BTMParameterQuantity-")):
+        return False
+    expected_expression = expected.get("expression")
+    actual_expression = actual.get("expression")
+    if not (
+        isinstance(expected_expression, str)
+        and isinstance(actual_expression, str)
+        and _CONCRETE_QUANTITY_EXPRESSION.fullmatch(expected_expression)
+        and _CONCRETE_QUANTITY_EXPRESSION.fullmatch(actual_expression)
+    ):
+        return False
+    expected_value = expected.get("value")
+    actual_value = actual.get("value")
+    if (
+        isinstance(expected_value, bool)
+        or isinstance(actual_value, bool)
+        or not isinstance(expected_value, (int, float))
+        or not isinstance(actual_value, (int, float))
+    ):
+        return False
+    return math.isclose(
+        float(expected_value),
+        float(actual_value),
+        rel_tol=1e-9,
+        abs_tol=1e-12,
+    )
+
+
+def _is_feature_reference_query(bt_type: Optional[str]) -> bool:
+    """Return whether a query object's featureId is semantic requested state."""
+    return bool(
+        isinstance(bt_type, str)
+        and bt_type.startswith("BTMIndividual")
+        and "Query-" in bt_type
+    )
+
+
 def _requested_subset_compare(
     expected: Any,
     actual: Any,
@@ -150,8 +197,22 @@ def _requested_subset_compare(
             if isinstance(expected.get("btType"), str)
             else parent_bt_type
         )
+        quantity_equivalent = _quantity_value_proves_expression_equivalence(
+            expected, actual, current_bt_type
+        )
+        feature_reference_query = _is_feature_reference_query(current_bt_type)
+        matching_feature_reference = (
+            feature_reference_query
+            and isinstance(expected.get("featureId"), str)
+            and bool(expected.get("featureId"))
+            and expected.get("featureId") == actual.get("featureId")
+        )
         for key, expected_value in expected.items():
-            if key in {"featureId", "nodeId"}:
+            if key == "nodeId" or (key == "featureId" and not feature_reference_query):
+                continue
+            if quantity_equivalent and key in {"expression", "units"}:
+                continue
+            if matching_feature_reference and key in {"queryString", "queryStatement"}:
                 continue
             if key not in actual:
                 return None

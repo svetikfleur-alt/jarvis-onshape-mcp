@@ -252,9 +252,10 @@ python -m pytest -m "not live_onshape" --cov=onshape_mcp --cov-branch --cov-repo
 
 Local live execution requires exactly one complete credential pair:
 `ONSHAPE_API_KEY` with `ONSHAPE_API_SECRET`, or `ONSHAPE_ACCESS_KEY` with
-`ONSHAPE_SECRET_KEY`. It also requires `JARVIS_LIVE_DOCUMENT_ID`,
+`ONSHAPE_SECRET_KEY`. Existing-model scenarios also require `JARVIS_LIVE_DOCUMENT_ID`,
 `JARVIS_LIVE_WORKSPACE_ID`, and `JARVIS_LIVE_ELEMENT_ID`. Replace all
-angle-bracket placeholders; neither helper prints a secret or ID. The exact
+angle-bracket placeholders; the create-only canary does not require model IDs,
+and neither helper prints a secret or ID. The exact
 budgets are 3 physical sends for read-only tests, 8 for mutation tests, and
 `JARVIS_LIVE_SUITE_BUDGET=30` for the suite. `live_budget(N)` can only lower a
 per-test limit. Keep execution serial: the only network permit is scoped to the
@@ -303,11 +304,13 @@ JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>
 JARVIS_LIVE_ELEMENT_ID='<element-id>' \
 run_local_live 'live_onshape and live_readonly' 0
 
-# Mutation harness contract (no WP-003 scenario is collected)
-ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>' \
-JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>' \
-JARVIS_LIVE_ELEMENT_ID='<element-id>' \
-run_local_live 'live_onshape and live_mutation' 1
+# create_document L3 canary (one new disposable document)
+(
+  export ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>'
+  export JARVIS_LIVE_TESTS=1 JARVIS_LIVE_MUTATIONS=1 JARVIS_LIVE_SUITE_BUDGET=5
+  python -m pytest tests/live/test_live_create_document.py \
+    -m 'live_onshape and live_mutation' -q -s --maxfail=1
+)
 ```
 
 For PowerShell, the helper restores all process variables in `finally`, checks
@@ -363,11 +366,31 @@ Invoke-LocalLive -Marker 'live_onshape and live_readonly' -MutationOptIn '0' `
   -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
   -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
 
-# Mutation harness contract (no WP-003 scenario is collected)
-Invoke-LocalLive -Marker 'live_onshape and live_mutation' -MutationOptIn '1' `
-  -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
-  -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
+# create_document L3 canary (one new disposable document)
+& powershell -NoProfile -Command {
+  $env:ONSHAPE_API_KEY = '<access-key>'; $env:ONSHAPE_API_SECRET = '<secret-key>'
+  $env:JARVIS_LIVE_TESTS = '1'; $env:JARVIS_LIVE_MUTATIONS = '1'
+  $env:JARVIS_LIVE_SUITE_BUDGET = '5'
+  python -m pytest tests/live/test_live_create_document.py `
+    -m 'live_onshape and live_mutation' -q -s --maxfail=1
+}
 ```
 
-WP-003 ships no live mutation scenario. Mutation gating exists only as a
-harness contract; WP-003 does not collect or run a mutating live test.
+The `create_document` L3 canary is the only collected live mutation scenario.
+It lives in `tests/live/test_live_create_document.py`, is marked
+`live_budget(5)`, generates a unique benchmark name, and exercises the same
+name-only autonomous policy as production. The tool caches authenticated
+session information, sends `isPublic:true` only for a confirmed Free plan, and
+creates one disposable document. The normal path resolves its workspace/default
+Part Studio and rereads it. A timed-out create POST is never retried; bounded
+exact-name searches plus one authoritative reread either verify the creation or
+leave it unverified. The canary never targets configured pre-existing document
+IDs and does not delete the created document.
+Run it serially with both `JARVIS_LIVE_TESTS=1` and
+`JARVIS_LIVE_MUTATIONS=1`; a missing opt-in or invalid live configuration is a
+hard skip/configuration error, never a fallback to mocks.
+Because it owns the new target, this create-only test does not require
+`JARVIS_LIVE_DOCUMENT_ID`, `JARVIS_LIVE_WORKSPACE_ID`, or
+`JARVIS_LIVE_ELEMENT_ID`. Select that file directly and set
+`JARVIS_LIVE_SUITE_BUDGET=5`; the test's `live_budget(5)` marker prevents a
+sixth physical send.

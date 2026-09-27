@@ -1067,6 +1067,9 @@ class TestCreateDocumentTool:
             ownerId="user1",
         )
         mock_document_manager.create_document = AsyncMock(return_value=mock_doc)
+        mock_document_manager.get_account_plan_group = AsyncMock(return_value=None)
+        mock_document_manager.get_workspaces = AsyncMock(return_value=[])
+        mock_document_manager.get_document = AsyncMock(return_value=mock_doc)
 
         arguments = {"name": "New Document"}
 
@@ -1077,6 +1080,11 @@ class TestCreateDocumentTool:
         assert isinstance(result[0], TextContent)
         assert "New Document" in result[0].text
         assert "new_doc_123" in result[0].text
+        mock_document_manager.create_document.assert_awaited_once_with(
+            name="New Document",
+            description=None,
+            is_public=None,
+        )
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.document_manager")
@@ -1094,6 +1102,8 @@ class TestCreateDocumentTool:
             description="A public document",
         )
         mock_document_manager.create_document = AsyncMock(return_value=mock_doc)
+        mock_document_manager.get_workspaces = AsyncMock(return_value=[])
+        mock_document_manager.get_document = AsyncMock(return_value=mock_doc)
 
         arguments = {
             "name": "Public Doc",
@@ -1129,8 +1139,12 @@ class TestCreateDocumentTool:
         result = await call_tool("create_document", arguments)
 
         assert isinstance(result, list)
-        assert "Error" in result[0].text
-        assert "403" in result[0].text
+        payload = __import__("json").loads(result[0].text)
+        assert payload["ok"] is False
+        assert payload["failure_kind"] == "http_rejection"
+        assert payload["mutation_verification"] == "failed"
+        assert payload["changed"] is False
+        assert payload["diagnostic"]["status_code"] == 403
 
     @pytest.mark.asyncio
     @patch("onshape_mcp.server.document_manager")
@@ -1145,7 +1159,11 @@ class TestCreateDocumentTool:
         result = await call_tool("create_document", arguments)
 
         assert isinstance(result, list)
-        assert "Error" in result[0].text
+        payload = __import__("json").loads(result[0].text)
+        assert payload["ok"] is False
+        assert payload["failure_kind"] == "local_failure"
+        assert payload["mutation_verification"] == "unverified"
+        assert payload["error_message"] == "Unexpected error"
 
 
 class TestCreatePartStudioTool:

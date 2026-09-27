@@ -264,9 +264,10 @@ python -m pytest -m "not live_onshape" --cov=onshape_mcp --cov-branch --cov-repo
 
 Live acceptance is local-only and fail-fast. It requires exactly one complete
 credential pair: `ONSHAPE_API_KEY` plus `ONSHAPE_API_SECRET`, or
-`ONSHAPE_ACCESS_KEY` plus `ONSHAPE_SECRET_KEY`. It also requires
+`ONSHAPE_ACCESS_KEY` plus `ONSHAPE_SECRET_KEY`. Existing-model scenarios also require
 `JARVIS_LIVE_DOCUMENT_ID`, `JARVIS_LIVE_WORKSPACE_ID`, and
-`JARVIS_LIVE_ELEMENT_ID`. Replace every angle-bracket placeholder below; the
+`JARVIS_LIVE_ELEMENT_ID`; the create-only canary does not. Replace every
+angle-bracket placeholder below; the
 commands never print those values. Read-only tests default to 3 physical sends,
 mutation tests to 8, and the suite to `JARVIS_LIVE_SUITE_BUDGET=30`; a
 `live_budget(N)` marker may only lower the per-test limit. Execution must remain
@@ -315,11 +316,13 @@ JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>
 JARVIS_LIVE_ELEMENT_ID='<element-id>' \
 run_local_live 'live_onshape and live_readonly' 0
 
-# Mutation harness contract (no WP-003 scenario is collected)
-ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>' \
-JARVIS_LIVE_DOCUMENT_ID='<document-id>' JARVIS_LIVE_WORKSPACE_ID='<workspace-id>' \
-JARVIS_LIVE_ELEMENT_ID='<element-id>' \
-run_local_live 'live_onshape and live_mutation' 1
+# create_document L3 canary (one new disposable document)
+(
+  export ONSHAPE_API_KEY='<access-key>' ONSHAPE_API_SECRET='<secret-key>'
+  export JARVIS_LIVE_TESTS=1 JARVIS_LIVE_MUTATIONS=1 JARVIS_LIVE_SUITE_BUDGET=5
+  python -m pytest tests/live/test_live_create_document.py \
+    -m 'live_onshape and live_mutation' -q -s --maxfail=1
+)
 ```
 
 For PowerShell, use this helper; `finally` restores every process variable and
@@ -375,15 +378,33 @@ Invoke-LocalLive -Marker 'live_onshape and live_readonly' -MutationOptIn '0' `
   -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
   -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
 
-# Mutation harness contract (no WP-003 scenario is collected)
-Invoke-LocalLive -Marker 'live_onshape and live_mutation' -MutationOptIn '1' `
-  -ApiKey '<access-key>' -ApiSecret '<secret-key>' -DocumentId '<document-id>' `
-  -WorkspaceId '<workspace-id>' -ElementId '<element-id>'
+# create_document L3 canary (one new disposable document)
+& powershell -NoProfile -Command {
+  $env:ONSHAPE_API_KEY = '<access-key>'; $env:ONSHAPE_API_SECRET = '<secret-key>'
+  $env:JARVIS_LIVE_TESTS = '1'; $env:JARVIS_LIVE_MUTATIONS = '1'
+  $env:JARVIS_LIVE_SUITE_BUDGET = '5'
+  python -m pytest tests/live/test_live_create_document.py `
+    -m 'live_onshape and live_mutation' -q -s --maxfail=1
+}
 ```
 
-WP-003 ships no live mutation scenario. The mutation command documents the
-guarded harness contract only; it does not authorize mutation or cause a live
-test to exist.
+The `create_document` L3 canary is the only collected live mutation scenario.
+It is marked `live_budget(5)`, generates a unique benchmark name, and calls the
+same autonomous name-only tool path used in production. That path caches the
+authenticated session plan, explicitly requests a public document only when
+Onshape confirms `planGroup=Free`, then creates one disposable document. A
+normal response resolves the new workspace/default Part Studio and rereads the
+document. If the create POST times out, Jarvis never retries it: bounded
+exact-name searches plus one authoritative reread either verify the creation or
+leave it unverified. The canary never targets configured pre-existing document
+IDs and does not delete the created document.
+Run it serially from `tests/live/test_live_create_document.py`; the separate
+`JARVIS_LIVE_MUTATIONS=1` opt-in is required in addition to live-test enablement.
+Because it owns the new target, this create-only test does not require
+`JARVIS_LIVE_DOCUMENT_ID`, `JARVIS_LIVE_WORKSPACE_ID`, or
+`JARVIS_LIVE_ELEMENT_ID`. Select that file directly and set
+`JARVIS_LIVE_SUITE_BUDGET=5`; the test's `live_budget(5)` marker prevents a
+sixth physical send.
 
 ## Attribution
 

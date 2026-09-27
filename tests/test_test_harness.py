@@ -379,6 +379,38 @@ def test_live_policy():
     result.assert_outcomes(skipped=1)
 
 
+def test_create_document_live_canary_does_not_require_preexisting_model_ids(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A create-only canary owns its target and needs no existing model IDs."""
+    _configure_subprocess(pytester, monkeypatch)
+    monkeypatch.setenv("JARVIS_LIVE_TESTS", "1")
+    monkeypatch.setenv("JARVIS_LIVE_MUTATIONS", "1")
+    monkeypatch.setenv("JARVIS_LIVE_SUITE_BUDGET", "5")
+    monkeypatch.setenv("ONSHAPE_ACCESS_KEY", "access-canary")
+    monkeypatch.setenv("ONSHAPE_SECRET_KEY", "secret-canary")
+    pytester.makepyfile(
+        """
+import pytest
+
+@pytest.mark.live_onshape
+@pytest.mark.live_mutation
+@pytest.mark.live_create_document
+@pytest.mark.live_budget(5)
+def test_live_policy(live_config):
+    assert live_config.document_id is None
+    assert live_config.workspace_id is None
+    assert live_config.element_id is None
+"""
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "-m", "live_onshape and live_mutation"
+    )
+
+    result.assert_outcomes(passed=1)
+
+
 @pytest.mark.parametrize(
     "markers",
     [

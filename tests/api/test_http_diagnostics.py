@@ -33,6 +33,17 @@ PRIVATE_QUERY = "private-query-canary"
 PRIVATE_BODY = "private-response-body-canary"
 
 
+def test_session_info_route_is_preserved_in_sanitized_telemetry() -> None:
+    descriptor = request_guard.sanitize_request(
+        "GET",
+        httpx.URL("https://cad.onshape.com/api/v17/users/sessioninfo"),
+    )
+
+    assert descriptor.method == "GET"
+    assert descriptor.host == "cad.onshape.com"
+    assert descriptor.route == "/api/v17/users/sessioninfo"
+
+
 def _status_error(status_code: int = 403) -> httpx.HTTPStatusError:
     request = httpx.Request(
         "GET",

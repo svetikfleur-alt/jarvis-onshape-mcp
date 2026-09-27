@@ -1,9 +1,43 @@
 """Offline contracts for the local-only live acceptance predicates."""
 
+from datetime import datetime, timezone
+from inspect import signature
+
+from tests.live.test_live_create_document import (
+    _create_document_canary_name,
+    test_live_create_document_canary as _live_create_document_canary,
+)
 from tests.live.test_live_deep_read import (
     _has_useful_normalized_parameters,
     _select_parameterized_ok_feature,
 )
+
+
+def test_create_document_canary_name_is_unique_and_bounded() -> None:
+    instant = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    first = _create_document_canary_name(instant, "abcdef12")
+    second = _create_document_canary_name(instant, "12345678")
+
+    assert first == "Jarvis create_document canary 20260925T120000Z abcdef12"
+    assert second != first
+    assert len(first) <= 128
+
+
+def test_create_document_canary_is_gated_bounded_and_owns_its_target() -> None:
+    marks = {
+        mark.name: mark
+        for mark in getattr(_live_create_document_canary, "pytestmark", [])
+    }
+
+    assert {
+        "live_onshape",
+        "live_mutation",
+        "live_create_document",
+        "live_budget",
+    } <= marks.keys()
+    assert marks["live_budget"].args == (5,)
+    assert "live_model_ids" not in signature(_live_create_document_canary).parameters
 
 
 def test_select_parameterized_ok_feature_skips_empty_and_non_ok_rows() -> None:

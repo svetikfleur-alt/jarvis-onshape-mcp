@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import os
 import re
+from typing import Optional
 
 
 _SEGMENT = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
@@ -16,13 +17,13 @@ class LiveConfigurationError(RuntimeError):
 class LiveConfig:
     access_key: str
     secret_key: str
-    document_id: str
-    workspace_id: str
-    element_id: str
+    document_id: Optional[str]
+    workspace_id: Optional[str]
+    element_id: Optional[str]
     suite_budget: int
 
 
-def load_live_config() -> LiveConfig:
+def load_live_config(*, require_model_ids: bool = True) -> LiveConfig:
     if os.getenv("JARVIS_LIVE_TESTS") != "1":
         raise LiveConfigurationError("LIVE_TESTS_NOT_ENABLED")
     primary = (os.getenv("ONSHAPE_ACCESS_KEY", ""), os.getenv("ONSHAPE_SECRET_KEY", ""))
@@ -32,16 +33,26 @@ def load_live_config() -> LiveConfig:
     if any(primary) != all(primary) or any(alternate) != all(alternate) or not (all(primary) or all(alternate)):
         raise LiveConfigurationError("LIVE_CREDENTIALS_INVALID")
     credentials = primary if all(primary) else alternate
-    ids = tuple(
-        os.getenv(name, "")
-        for name in (
-            "JARVIS_LIVE_DOCUMENT_ID",
-            "JARVIS_LIVE_WORKSPACE_ID",
-            "JARVIS_LIVE_ELEMENT_ID",
+    if require_model_ids:
+        ids: tuple[Optional[str], Optional[str], Optional[str]] = tuple(
+            os.getenv(name, "")
+            for name in (
+                "JARVIS_LIVE_DOCUMENT_ID",
+                "JARVIS_LIVE_WORKSPACE_ID",
+                "JARVIS_LIVE_ELEMENT_ID",
+            )
         )
-    )
-    if any(not _SEGMENT.fullmatch(value) or value in {".", ".."} for value in ids):
-        raise LiveConfigurationError("LIVE_MODEL_IDS_INVALID")
+        if any(
+            not isinstance(value, str)
+            or not _SEGMENT.fullmatch(value)
+            or value in {".", ".."}
+            for value in ids
+        ):
+            raise LiveConfigurationError("LIVE_MODEL_IDS_INVALID")
+    else:
+        # A create-only canary must not receive or accidentally target ambient
+        # identifiers for an existing user document.
+        ids = (None, None, None)
     raw_budget = os.getenv("JARVIS_LIVE_SUITE_BUDGET", "30")
     try:
         suite_budget = int(raw_budget)

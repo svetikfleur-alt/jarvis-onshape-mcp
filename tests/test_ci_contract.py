@@ -185,7 +185,11 @@ def test_readmes_document_guarded_local_live_contract_without_private_values() -
         "serial",
         "guarded transport",
         "exactly one complete credential pair",
-        "WP-003 ships no live mutation scenario",
+        "create_document L3 canary",
+        "tests/live/test_live_create_document.py",
+        "live_budget(5)",
+        "does not delete the created document",
+        "this create-only test does not require",
     )
 
     for readme in ("README.md", "tests/README.md"):

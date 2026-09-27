@@ -23,6 +23,7 @@ def pytest_configure(config):
         "live_onshape: explicitly selected live Onshape test",
         "live_readonly: read-only live test",
         "live_mutation: mutating live test",
+        "live_create_document: create-only live mutation canary",
         "live_budget(limit): lower a live test physical-send budget",
     ):
         config.addinivalue_line("markers", marker)
@@ -127,8 +128,11 @@ def pytest_collection_modifyitems(config, items):
         live = item.get_closest_marker("live_onshape") is not None
         readonly = item.get_closest_marker("live_readonly") is not None
         mutation = item.get_closest_marker("live_mutation") is not None
+        create_document = item.get_closest_marker("live_create_document") is not None
         budget = item.get_closest_marker("live_budget")
         if live != (readonly or mutation) or (readonly and mutation) or (budget and not live):
+            _fail("LIVE_MARKERS_INVALID")
+        if create_document and not (live and mutation and not readonly):
             _fail("LIVE_MARKERS_INVALID")
         if budget:
             if len(budget.args) != 1 or not isinstance(budget.args[0], int) or budget.args[0] <= 0:
@@ -147,8 +151,13 @@ def pytest_collection_modifyitems(config, items):
         _fail("LIVE_POSITIVE_SELECTION_REQUIRED")
     if os.getenv("PYTEST_XDIST_WORKER") or getattr(config.option, "numprocesses", 0):
         _fail("LIVE_PARALLEL_FORBIDDEN")
+    create_only = bool(live_items) and all(
+        item.get_closest_marker("live_create_document") is not None
+        for item in live_items
+    )
+    config._jarvis_live_requires_model_ids = not create_only
     try:
-        load_live_config()
+        load_live_config(require_model_ids=not create_only)
     except LiveConfigurationError as error:
         _fail(str(error))
     config._jarvis_live_session_report = True
@@ -159,8 +168,11 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(scope="session")
-def live_config():
-    return load_live_config()
+def live_config(pytestconfig):
+    require_model_ids = getattr(
+        pytestconfig, "_jarvis_live_requires_model_ids", True
+    )
+    return load_live_config(require_model_ids=require_model_ids)
 
 
 @pytest.fixture(scope="session")
@@ -190,6 +202,15 @@ def live_budget_guard(request, live_suite_budget, live_session_telemetry):
 
 @pytest.fixture
 def live_model_ids(live_config):
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            live_config.document_id,
+            live_config.workspace_id,
+            live_config.element_id,
+        )
+    ):
+        raise LiveConfigurationError("LIVE_MODEL_IDS_INVALID")
     return {
         "document_id": live_config.document_id,
         "workspace_id": live_config.workspace_id,
