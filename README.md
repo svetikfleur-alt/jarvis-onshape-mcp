@@ -17,6 +17,11 @@ benchmark data behind that workflow.
 - **Truth-telling on every mutation.** Every tool returns `{ok, status,
   feature_id, feature_name, error_message, changes?, hints?}`. Silent regen
   failures are surfaced, warnings are enriched with actionable fixes.
+- **One-call verified feature execution.** `execute_feature` delegates exactly
+  one supported Sketch/Extrude/update/Pattern/Shell/Chamfer/Draft/Move Body
+  request to the existing handler and returns authoritative mutation truth in
+  a compact shared contract. Diagnostic mode retains the existing bounded
+  low-level result when deeper evidence is needed.
 - **Vision.** `render_part_studio_views` and `render_assembly_views` return
   shaded PNGs (front/top/right/iso). `crop_image` zooms in on regions.
   `load_local_image` caches a reference image (drawing, photo, sketch) the
@@ -185,6 +190,7 @@ Roughly 60 tools across these groups:
 
 | Group | Highlights |
 |-------|-----------|
+| Preferred protocol | `execute_feature`, `inspect_feature_compact`, `get_compact_model_state`, `get_execution_protocol_metrics` |
 | Document | `create_document`, `find_part_studios`, `get_elements` |
 | Sketch | `create_sketch` (multi-entity), plus rectangle / circle / line / arc / rounded rect primitives |
 | Feature | `create_extrude`, `create_revolve`, `create_thicken`, `create_fillet`, `create_chamfer`, `create_boolean`, `create_linear_pattern`, `create_circular_pattern` |
@@ -197,6 +203,14 @@ Roughly 60 tools across these groups:
 
 Full schemas are discoverable from Claude via `ToolSearch` — no separate
 docs to read.
+
+For an already-resolved Part Studio, the ordinary successful path is one
+`execute_feature` invocation followed by one compact result. A
+`mutation.state` of `verified` proves the requested feature state and does not
+require a verification-only `describe_part_studio` call. Topology/entity reads
+and renders remain available when the next engineering decision actually needs
+them. Existing low-level tools remain backward-compatible advanced/debug
+surfaces.
 
 ## Known limitations
 

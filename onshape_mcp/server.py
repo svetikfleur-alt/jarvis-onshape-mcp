@@ -114,11 +114,25 @@ logger.add(
 # turns aren't spent guessing tool names.
 _INSTRUCTIONS = """\
 Jarvis Onshape MCP — drive real CAD. Tools are lazy-loaded (fetch schemas via
-ToolSearch before calling). Use `describe_part_studio` as your verification
-loop after every mutation — it returns topology + multi-view renders in one
-call.
+ToolSearch before calling). For ordinary supported Part Studio work, prefer
+`execute_feature`: one agent call delegates one requested mutation to the
+existing handler, performs its authoritative verification, and returns a
+compact semantic result. When `mutation.state` is `verified`, no verification-
+only follow-up is required. Read topology or renders only when the next
+engineering decision depends on geometry, picked entities, or visual evidence.
 
 ## Tool index
+
+### Preferred execution protocol
+- execute_feature — one requested Sketch/Extrude/update/linear Pattern/Shell/
+  Chamfer/Draft/Move Body mutation plus existing authoritative verification;
+  compact by default, diagnostic evidence opt-in
+- inspect_feature_compact — one authoritative read for one bounded feature;
+  no context-start call required
+- get_compact_model_state — bounded feature/body identity and regeneration
+  summary; never dumps topology
+- get_execution_protocol_metrics — process-local invocation/payload counters;
+  proxy counts are labeled and no telemetry leaves the process
 
 ### Documents
 - create_document — new doc. Returns (document_id, workspace_id, part_studio_id) in ONE call.
@@ -157,7 +171,9 @@ list_entities, or from create_offset_plane).
 - get_runtime_info — non-secret package/source/Python/credential-presence diagnostic; never calls Onshape
 - start_model_context / get_feature_tree_compact / find_features / inspect_feature — bounded cached feature intelligence
 - inspect_feature_dependencies / get_dependency_slice / update_working_state / get_context_status — local dependency navigation and working state
-- describe_part_studio — topology + multi-view renders in one call. First stop after every mutation.
+- describe_part_studio — topology + multi-view renders for decisions that need
+  geometry or visual evidence; not required merely to re-verify a `verified`
+  execute_feature result
 - list_entities — faces/edges/vertices with filters: outward_axis, at_z_mm, geometryType, radius_range_mm, length_range_mm
 - get_features / get_body_details — feature tree with statuses, per-part face/edge IDs
 - get_mass_properties / get_bounding_box / measure

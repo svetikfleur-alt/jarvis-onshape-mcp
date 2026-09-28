@@ -523,6 +523,9 @@ class ExecutionProtocolMetrics:
         self._by_family: dict[str, dict[str, int]] = defaultdict(
             lambda: {"calls": 0, "response_bytes": 0, "max_response_bytes": 0}
         )
+        self._by_response_mode: dict[str, dict[str, int]] = defaultdict(
+            lambda: {"calls": 0, "response_bytes": 0, "max_response_bytes": 0}
+        )
 
     def record(
         self,
@@ -534,6 +537,14 @@ class ExecutionProtocolMetrics:
         safe_bytes = max(0, int(response_bytes))
         family = _family(tool_name)
         target_key = _target_key(arguments)
+        response_mode = "legacy"
+        if tool_name == "execute_feature":
+            requested_mode = arguments.get("responseMode", "compact")
+            response_mode = (
+                requested_mode
+                if requested_mode in {"compact", "diagnostic"}
+                else "unknown"
+            )
         with self._lock:
             self._calls += 1
             self._response_bytes += safe_bytes
@@ -542,6 +553,12 @@ class ExecutionProtocolMetrics:
             family_row["response_bytes"] += safe_bytes
             family_row["max_response_bytes"] = max(
                 family_row["max_response_bytes"], safe_bytes
+            )
+            mode_row = self._by_response_mode[response_mode]
+            mode_row["calls"] += 1
+            mode_row["response_bytes"] += safe_bytes
+            mode_row["max_response_bytes"] = max(
+                mode_row["max_response_bytes"], safe_bytes
             )
             if safe_bytes > self._largest_bytes:
                 self._largest_tool = tool_name
@@ -567,6 +584,7 @@ class ExecutionProtocolMetrics:
             return {
                 "contract": "jarvis.execution_protocol_metrics.v1",
                 "mcp_tool_invocations": self._calls,
+                "model_tool_round_trip_proxy": self._calls,
                 "logical_operations": self._logical_operations,
                 "response_bytes": self._response_bytes,
                 "largest_response": {
@@ -579,7 +597,14 @@ class ExecutionProtocolMetrics:
                     family: dict(values)
                     for family, values in sorted(self._by_family.items())
                 },
+                "by_response_mode": {
+                    mode: dict(values)
+                    for mode, values in sorted(self._by_response_mode.items())
+                },
                 "proxy_definitions": {
+                    "model_tool_round_trip_proxy": (
+                        "one counted outer MCP tool invocation equals one round-trip proxy"
+                    ),
                     "verification_followup_proxy": (
                         "describe_part_studio/get_compact_model_state called on a target "
                         "after a measured mutation"

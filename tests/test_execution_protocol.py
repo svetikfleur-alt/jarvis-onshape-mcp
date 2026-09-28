@@ -544,3 +544,47 @@ async def test_execution_protocol_metrics_tool_returns_bounded_snapshot() -> Non
     assert payload["contract"] == "jarvis.execution_protocol_metrics.v1"
     assert isinstance(payload["mcp_tool_invocations"], int)
     assert "proxy_definitions" in payload
+
+
+@pytest.mark.asyncio
+async def test_outer_execute_feature_call_is_counted_once_by_response_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fresh_metrics = ExecutionProtocolMetrics()
+    monkeypatch.setattr(server, "execution_protocol_metrics", fresh_metrics)
+    legacy = _legacy_result(
+        changes={
+            "summary": "faces +250/-250; edges +500/-500",
+            "faces_added": [{"id": f"face-new-{index}"} for index in range(250)],
+            "faces_removed": [{"id": f"face-old-{index}"} for index in range(250)],
+            "edges_added": [{"id": f"edge-new-{index}"} for index in range(500)],
+            "edges_removed": [{"id": f"edge-old-{index}"} for index in range(500)],
+        }
+    )
+    delegated = AsyncMock(
+        return_value=[TextContent(type="text", text=json.dumps(legacy))]
+    )
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+
+    compact_response = await server.call_tool(
+        "execute_feature",
+        {
+            "operation": "create_extrude",
+            "request": {**TARGET, "sketchFeatureId": "sketch-safe", "depth": "10 mm"},
+        },
+    )
+    compact_bytes = len(compact_response[0].text.encode("utf-8"))
+    snapshot = fresh_metrics.snapshot()
+
+    delegated.assert_awaited_once()
+    assert snapshot["mcp_tool_invocations"] == 1
+    assert snapshot["model_tool_round_trip_proxy"] == 1
+    assert snapshot["logical_operations"] == 1
+    assert snapshot["by_family"]["mutation"]["calls"] == 1
+    assert snapshot["by_response_mode"]["compact"] == {
+        "calls": 1,
+        "response_bytes": compact_bytes,
+        "max_response_bytes": compact_bytes,
+    }
+    assert compact_bytes < 4_000
+    assert "face-new-249" not in compact_response[0].text

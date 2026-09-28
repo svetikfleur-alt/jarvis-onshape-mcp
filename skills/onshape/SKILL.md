@@ -44,16 +44,39 @@ This applies on the assembly side too: `transform_instance` translations, `set_i
 
 When sketching on a picked face (`faceId` from `list_entities`), the sketch-local axes are defined by that face's own coordinate system. Geometry you sketch is interpreted in the face's plane, not world space.
 
-## The render-first protocol
+## The verified-execution-first protocol
 
-After every feature that creates or modifies visible geometry:
+For supported Part Studio mutations, prefer `execute_feature`. You still make
+the engineering decision: choose exactly one operation, target, entity set,
+and parameter set. Jarvis only performs the deterministic mechanics already
+owned by that operation: delegate one mutation, preserve regeneration checks,
+authoritatively reread requested state, and compact the result.
 
-1. Call `describe_part_studio` (not individual `render_` calls — describe gives structured text + images in one shot).
-2. **Verify against expectations in the text** first: is the new feature present in `FEATURE TREE` with status `OK`/`INFO`? Are the expected new faces/edges in `BODIES`? Does `MASS PROPERTIES: volume` line up with what you predicted?
-3. If text checks out, glance at the iso view for anything visually off (asymmetric when should be symmetric, missing material, flipped direction).
-4. If suspicious, `crop_image` on the specific area. Normalized `[x1,y1,x2,y2]` in `[0,1]`.
+1. Read the compact result's `mutation.state`, `regeneration`, requested
+   canonical parameters, and blocker (if any).
+2. If `mutation.state == "verified"`, the requested feature state is proven;
+   do not spend another agent call merely to repeat that verification.
+3. Call `list_entities` only when the next operation needs a face/edge/body ID.
+4. Call `describe_part_studio` only when geometry, mass, topology, or visual
+   evidence is necessary for the next engineering decision. If suspicious,
+   `crop_image` on the specific area; normalized bbox is `[x1,y1,x2,y2]` in
+   `[0,1]`.
 
-Text checks catch arithmetic and counting errors (my weak spot). Image checks catch orientation and topology errors. Neither alone is sufficient.
+Requested-state verification, topology, and rendering prove different layers.
+A verified feature value does not prove topology or design intent; conversely,
+a plausible render does not prove canonical parameters. Request only the layer
+the current decision needs.
+
+### Preferred and advanced surfaces
+
+- Preferred mutation: `execute_feature(responseMode="compact")`.
+- Preferred single-feature read without a context handle:
+  `inspect_feature_compact`.
+- Preferred bounded overview: `get_compact_model_state`.
+- Advanced/debug: the existing `create_*`, `update_feature`, `get_features`,
+  `get_body_details`, `list_entities`, and `describe_part_studio` tools remain
+  available. Use `execute_feature(responseMode="diagnostic")` when you need
+  its delegated public result in addition to the compact contract.
 
 ## Sketches: coordinate-first vs constraint-first
 
@@ -232,7 +255,9 @@ Part Studio mutations return status plus `transport_ok`, `http_ok`,
 - `status == "UNKNOWN"` never proves regeneration success.
 
 The complete raw Onshape response is internal evidence and is not emitted in
-normal MCP mutation results.
+normal MCP mutation results. `execute_feature(responseMode="diagnostic")`
+retains the delegated tool's already-bounded public result; it does not expose
+the private raw response.
 
 Mate handlers (`create_fastened_mate` / `create_revolute_mate` / `create_slider_mate` / `create_cylindrical_mate` / `create_mate_connector`) share the same `{ok, status, ...}` contract via `apply_assembly_feature_and_check`. A mate that silently flips an instance still shows up as `status="ERROR"` or `"WARNING"` on the mate-level response — no need to visually check every mate just to catch a solver rejection. The 4-mate-for-2-part bracket dogfood burned ~50 turns to the now-fixed prose-return of this path.
 
@@ -331,7 +356,7 @@ The orchestrator creates a Feature Studio element, uploads the source, pulls the
 This MCP server exposes many deferred tools. Every time you call a tool that hasn't been loaded, the runtime spends a round-trip loading the schema. **Batch-load the tool surface in one `ToolSearch` call upfront**:
 
 ```
-ToolSearch(query="select:mcp__onshape__create_sketch,mcp__onshape__create_sketch_rectangle,mcp__onshape__create_sketch_circle,mcp__onshape__create_extrude,mcp__onshape__create_fillet,mcp__onshape__create_chamfer,mcp__onshape__create_shell,mcp__onshape__create_offset_plane,mcp__onshape__list_entities,mcp__onshape__describe_part_studio,mcp__onshape__measure,mcp__onshape__get_mass_properties,mcp__onshape__export_part_studio,mcp__onshape__create_document,mcp__onshape__create_part_studio", max_results=15)
+ToolSearch(query="select:mcp__onshape__execute_feature,mcp__onshape__inspect_feature_compact,mcp__onshape__get_compact_model_state,mcp__onshape__create_sketch,mcp__onshape__create_extrude,mcp__onshape__update_feature,mcp__onshape__list_entities,mcp__onshape__describe_part_studio,mcp__onshape__measure,mcp__onshape__get_mass_properties,mcp__onshape__export_part_studio,mcp__onshape__create_document,mcp__onshape__create_part_studio", max_results=15)
 ```
 
 Saves 3-5 individual search calls per session. The multi-entity `create_sketch` collapses a lot of small cases; prefer it over per-primitive tools.
