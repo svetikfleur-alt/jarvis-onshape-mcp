@@ -1,6 +1,6 @@
 ---
 name: onshape
-description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Render-first and entity-first workflows, unit + coordinate conventions, iteration discipline, when to reach for FeatureScript, and the gotchas (REMOVE-on-face auto-flip, Variable Studios as separate elements, deterministic ID remapping). Load before building anything in Onshape — the plugin's MCP tool surface makes more sense with this doc in context.
+description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Staged verification and entity-first workflows, unit + coordinate conventions, iteration discipline, when to reach for FeatureScript, and provider-specific gotchas. Load before building anything in Onshape.
 ---
 
 # Jarvis Onshape MCP — Claude Skill Guide
@@ -8,22 +8,15 @@ description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Rende
 Loaded as context for any Claude session driving the Jarvis Onshape MCP plugin.
 Encodes the protocols that keep CAD builds from silently failing. Short, imperative.
 
-## Think out loud
+## Concise operational narration
 
-Before every non-trivial tool call (sketch, extrude, boolean, fillet,
-chamfer, describe, export), emit a short plan text (1-3 sentences, plain
-assistant output) saying **WHY** you're making this call and **WHAT you
-expect to see / build**. Example before an extrude:
+Before a material mutation or inspection, state the intended change and expected
+evidence in one short sentence. Afterward, report a mismatch, warning, blocker,
+or decision that affects later work. Do not print the complete engineering
+checklist or narrate routine stable-state checks.
 
-> *"Extruding the base rectangle 30 mm up. Expect a flat plate with the
-> four corner arcs intact, bbox (500, 780, 30)."*
-
-After each result, also say 1-2 sentences about **what actually happened**
-— especially if the result surprised you. If a describe_part_studio shows
-a feature at the wrong Z, name that out loud before deciding how to fix.
-
-Don't let your only visible output be tool-call JSON. The observer watching
-the run relies on these thought lines to catch bugs in your reasoning.
+Example: *"Extruding the base rectangle 30 mm; expect one plate body with the
+four corner arcs preserved."*
 
 ## Units
 
@@ -44,16 +37,25 @@ This applies on the assembly side too: `transform_instance` translations, `set_i
 
 When sketching on a picked face (`faceId` from `list_entities`), the sketch-local axes are defined by that face's own coordinate system. Geometry you sketch is interpreted in the face's plane, not world space.
 
-## The render-first protocol
+## The staged verification protocol
 
-After every feature that creates or modifies visible geometry:
+Use the mutation result and local feature/sketch evidence after each change. Do
+not call a full describe or render after every feature.
 
-1. Call `describe_part_studio` (not individual `render_` calls — describe gives structured text + images in one shot).
-2. **Verify against expectations in the text** first: is the new feature present in `FEATURE TREE` with status `OK`/`INFO`? Are the expected new faces/edges in `BODIES`? Does `MASS PROPERTIES: volume` line up with what you predicted?
-3. If text checks out, glance at the iso view for anything visually off (asymmetric when should be symmetric, missing material, flipped direction).
-4. If suspicious, `crop_image` on the specific area. Normalized `[x1,y1,x2,y2]` in `[0,1]`.
+At major checkpoints—after primary form, after major functional geometry, around
+one bounded refinement pass, and at final review—call `describe_part_studio` for
+compact structured state plus views when available:
 
-Text checks catch arithmetic and counting errors (my weak spot). Image checks catch orientation and topology errors. Neither alone is sufficient.
+1. Verify the relevant feature status and requested state in text first.
+2. Check affected bodies, measurements, or mass properties when the claim needs
+   them.
+3. Use the appropriate view for orientation, topology, proportion, or missing
+   visible geometry; crop only a suspicious area.
+
+Add an intermediate describe when a mutation is `unverified`, state is
+surprising, or the next feature depends on a newly generated entity. Reuse known
+stable evidence otherwise. Text, measurements, and images prove different layers;
+none alone proves engineering completion.
 
 ## Sketches: coordinate-first vs constraint-first
 
