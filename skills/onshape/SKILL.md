@@ -44,14 +44,27 @@ This applies on the assembly side too: `transform_instance` translations, `set_i
 
 When sketching on a picked face (`faceId` from `list_entities`), the sketch-local axes are defined by that face's own coordinate system. Geometry you sketch is interpreted in the face's plane, not world space.
 
-## The render-first protocol
+## The visual-checkpoint protocol
 
-After every feature that creates or modifies visible geometry:
+When a mutation returns `mutation_verification="verified"`, its requested
+feature state and regeneration status have already been reread authoritatively.
+Continue without another tool call when the next step uses only that proven
+state.
 
-1. Call `describe_part_studio` (not individual `render_` calls — describe gives structured text + images in one shot).
-2. **Verify against expectations in the text** first: is the new feature present in `FEATURE TREE` with status `OK`/`INFO`? Are the expected new faces/edges in `BODIES`? Does `MASS PROPERTIES: volume` line up with what you predicted?
-3. If text checks out, glance at the iso view for anything visually off (asymmetric when should be symmetric, missing material, flipped direction).
-4. If suspicious, `crop_image` on the specific area. Normalized `[x1,y1,x2,y2]` in `[0,1]`.
+Call `describe_part_studio` when the next engineering decision depends on body
+shape, dimensions, topology, or appearance, and at meaningful visual milestones
+or final QA. Then:
+
+1. Verify expectations in the structured text: feature status, body counts,
+   bounding box, and mass properties.
+2. Inspect the iso view for orientation, symmetry, missing material, and other
+   visual semantics.
+3. If suspicious, use `crop_image` on the relevant area.
+
+If the next operation needs a face, edge, or body ID, call a filtered
+`list_entities`. Jarvis invalidates its topology snapshot after mutations, so
+the next read is fresh. Do not call `describe_part_studio`, `get_features`, or
+`inspect_feature` solely to re-prove a verified mutation.
 
 Text checks catch arithmetic and counting errors (my weak spot). Image checks catch orientation and topology errors. Neither alone is sufficient.
 

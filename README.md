@@ -185,11 +185,11 @@ Roughly 60 tools across these groups:
 
 | Group | Highlights |
 |-------|-----------|
-| Document | `create_document`, `find_part_studios`, `get_elements` |
+| Document | `create_document`, `find_part_studios`, `get_elements`, `get_document_hygiene` |
 | Sketch | `create_sketch` (multi-entity), plus rectangle / circle / line / arc / rounded rect primitives |
 | Feature | `create_extrude`, `create_revolve`, `create_thicken`, `create_fillet`, `create_chamfer`, `create_boolean`, `create_linear_pattern`, `create_circular_pattern` |
 | Assembly | `add_assembly_instance`, `create_fastened_mate`, `create_slider_mate`, `create_revolute_mate`, `create_cylindrical_mate`, `align_instance_to_face`, `check_assembly_interference` |
-| Introspection | `describe_part_studio`, `list_entities`, `get_body_details`, `get_bounding_box`, `get_mass_properties`, `measure`, `get_face_coordinate_system` |
+| Introspection | `describe_part_studio`, `list_entities`, `get_body_details`, `get_bounding_box`, `get_mass_properties`, `measure`, `get_face_coordinate_system`, `get_execution_metrics` |
 | Variables | `create_variable_studio`, `set_variable`, `get_variables` |
 | FeatureScript | `eval_featurescript`, `write_featurescript_feature` |
 | Rendering | `render_part_studio_views`, `render_assembly_views`, `crop_image`, `load_local_image`, `compare_to_reference`, `extract_drawing_dimensions` |
