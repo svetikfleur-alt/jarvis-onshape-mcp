@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
+from mcp.types import TextContent
+import pytest
+
+import onshape_mcp.server as server
 from onshape_mcp.execution_protocol import (
     ExecutionProtocolMetrics,
     canonical_request,
@@ -326,3 +331,216 @@ def test_metrics_count_outer_operations_and_response_families() -> None:
         "response_bytes": 1200,
         "max_response_bytes": 1200,
     }
+
+
+@pytest.mark.asyncio
+async def test_preferred_protocol_tools_have_bounded_schemas() -> None:
+    tools = {tool.name: tool for tool in await server.list_tools()}
+
+    assert {
+        "execute_feature",
+        "inspect_feature_compact",
+        "get_compact_model_state",
+        "get_execution_protocol_metrics",
+    } <= tools.keys()
+    execute_schema = tools["execute_feature"].inputSchema
+    assert execute_schema["additionalProperties"] is False
+    assert execute_schema["properties"]["operation"]["enum"] == [
+        "create_sketch",
+        "create_extrude",
+        "update_feature",
+        "create_linear_pattern",
+        "create_shell",
+        "create_chamfer",
+        "create_draft",
+        "move_body",
+    ]
+    assert execute_schema["properties"]["responseMode"]["enum"] == [
+        "compact",
+        "diagnostic",
+    ]
+    assert execute_schema["required"] == ["operation", "request"]
+
+
+@pytest.mark.asyncio
+async def test_execute_feature_delegates_exactly_once_and_returns_same_feature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delegated = AsyncMock(
+        return_value=[TextContent(type="text", text=json.dumps(_legacy_result()))]
+    )
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+    request = {
+        **TARGET,
+        "name": "Main Extrude",
+        "sketchFeatureId": "sketch-safe",
+        "depth": "27.6 mm",
+        "operationType": "NEW",
+    }
+
+    response = await server.call_tool(
+        "execute_feature",
+        {"operation": "create_extrude", "request": request},
+    )
+    payload = json.loads(response[0].text)
+
+    delegated.assert_awaited_once_with("create_extrude", request)
+    assert payload["feature"]["id"] == "extrude-safe"
+    assert payload["requested_parameters"]["depth"] == "27.6 mm"
+    assert payload["mutation"]["state"] == "verified"
+    assert payload["followup"]["required"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_feature_diagnostic_mode_retains_legacy_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = _legacy_result(
+        changes={"summary": "faces +1/-0", "faces_added": [{"id": "face-safe"}]}
+    )
+    delegated = AsyncMock(
+        return_value=[TextContent(type="text", text=json.dumps(legacy))]
+    )
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+
+    response = await server.call_tool(
+        "execute_feature",
+        {
+            "operation": "create_extrude",
+            "request": {**TARGET, "sketchFeatureId": "sketch-safe", "depth": "10 mm"},
+            "responseMode": "diagnostic",
+        },
+    )
+    payload = json.loads(response[0].text)
+
+    assert payload["diagnostic"]["legacy_result"] == legacy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verification", "reason_code"),
+    [
+        ("failed", "FEATURE_REGENERATION_ERROR"),
+        ("unverified", "AUTHORITATIVE_REREAD_FAILED"),
+    ],
+)
+async def test_execute_feature_preserves_non_success_state_and_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    verification: str,
+    reason_code: str,
+) -> None:
+    delegated = AsyncMock(
+        return_value=[
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    _legacy_result(
+                        ok=False,
+                        status="ERROR" if verification == "failed" else "UNKNOWN",
+                        regen_ok=False if verification == "failed" else None,
+                        mutation_verification=verification,
+                        error_message="Authoritative evidence did not prove the request.",
+                        reason_code=reason_code,
+                    )
+                ),
+            )
+        ]
+    )
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+
+    response = await server.call_tool(
+        "execute_feature",
+        {
+            "operation": "update_feature",
+            "request": {
+                **TARGET,
+                "featureId": "extrude-safe",
+                "updates": [{"parameterId": "depth", "expression": "30 mm"}],
+            },
+        },
+    )
+    payload = json.loads(response[0].text)
+
+    assert payload["mutation"]["state"] == verification
+    assert payload["blocker"]["reason_code"] == reason_code
+    assert payload["followup"]["required"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_feature_rejects_nested_or_unsupported_operation_without_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delegated = AsyncMock()
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+
+    response = await server.call_tool(
+        "execute_feature",
+        {"operation": "execute_feature", "request": TARGET},
+    )
+    payload = json.loads(response[0].text)
+
+    delegated.assert_not_awaited()
+    assert payload["ok"] is False
+    assert payload["mutation_verification"] == "failed"
+    assert payload["reason_code"] == "LOCAL_MUTATION_REJECTED"
+
+
+@pytest.mark.asyncio
+async def test_inspect_feature_compact_requires_one_authoritative_feature_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_features = AsyncMock(return_value=_features_doc())
+    monkeypatch.setattr(server.partstudio_manager, "get_features", get_features)
+
+    response = await server.call_tool(
+        "inspect_feature_compact",
+        {**TARGET, "featureId": "extrude-safe", "maxParameters": 4},
+    )
+    payload = json.loads(response[0].text)
+
+    get_features.assert_awaited_once_with("doc-safe", "workspace-safe", "element-safe")
+    assert payload["contract"] == "jarvis.compact_feature.v1"
+    assert payload["feature"]["feature_id"] == "extrude-safe"
+    assert payload["feature"]["canonical_parameters"]["depth"]["expression"] == "27.6 mm"
+    assert "features" not in payload
+
+
+@pytest.mark.asyncio
+async def test_get_compact_model_state_reads_features_and_parts_without_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_features = AsyncMock(return_value=_features_doc())
+    get_parts = AsyncMock(return_value=[{"partId": "body-1", "name": "Enclosure"}])
+    get_body_details = AsyncMock()
+    monkeypatch.setattr(server.partstudio_manager, "get_features", get_features)
+    monkeypatch.setattr(server.partstudio_manager, "get_parts", get_parts)
+    monkeypatch.setattr(server.partstudio_manager, "get_body_details", get_body_details)
+
+    response = await server.call_tool(
+        "get_compact_model_state",
+        {
+            **TARGET,
+            "recentFeatureLimit": 10,
+            "maxParametersPerFeature": 4,
+            "changedFeatureIds": ["extrude-safe"],
+        },
+    )
+    payload = json.loads(response[0].text)
+
+    get_features.assert_awaited_once_with("doc-safe", "workspace-safe", "element-safe")
+    get_parts.assert_awaited_once_with("doc-safe", "workspace-safe", "element-safe")
+    get_body_details.assert_not_awaited()
+    assert payload["contract"] == "jarvis.compact_model_state.v1"
+    assert payload["bodies"]["count"] == 1
+    assert payload["changed_feature_ids"] == ["extrude-safe"]
+    assert payload["unknown_or_stale"][0]["category"] == "topology"
+
+
+@pytest.mark.asyncio
+async def test_execution_protocol_metrics_tool_returns_bounded_snapshot() -> None:
+    response = await server.call_tool("get_execution_protocol_metrics", {})
+    payload = json.loads(response[0].text)
+
+    assert payload["contract"] == "jarvis.execution_protocol_metrics.v1"
+    assert isinstance(payload["mcp_tool_invocations"], int)
+    assert "proxy_definitions" in payload

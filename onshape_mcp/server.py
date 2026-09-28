@@ -91,6 +91,13 @@ from .governance import (
     serialize_bounded,
     summarize_features,
 )
+from .execution_protocol import (
+    ExecutionProtocolMetrics,
+    SUPPORTED_EXECUTION_OPERATIONS,
+    compact_execution_result,
+    compact_feature,
+    compact_model_state,
+)
 
 # Configure loguru to output to stderr
 logger.remove()  # Remove default handler
@@ -211,6 +218,7 @@ measurement_manager = MeasurementManager(client)
 describe_manager = DescribeManager(client)
 custom_feature_manager = CustomFeatureManager(client)
 context_store = ContextStore()
+execution_protocol_metrics = ExecutionProtocolMetrics()
 
 
 def _governance_content(envelope: ObservationEnvelope, record: Any) -> list[TextContent]:
@@ -286,6 +294,135 @@ async def list_tools() -> list[Tool]:
                 "Report the running Jarvis package version, resolved source path, Python "
                 "environment, credential presence state, and network/auth test state. "
                 "Never returns credential values and never calls the network."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="execute_feature",
+            description=(
+                "Preferred single-call Part Studio feature path. The caller makes the "
+                "engineering choice and supplies one existing operation plus that tool's "
+                "ordinary request object. Jarvis delegates exactly one mutation to the "
+                "existing handler, preserves its authoritative regeneration/requested-state "
+                "verification, and returns a compact semantic result. Supported operations: "
+                "create_sketch, create_extrude, update_feature, create_linear_pattern, "
+                "create_shell, create_chamfer, create_draft, move_body. Use diagnostic mode "
+                "only when the existing bounded low-level evidence is needed. This tool "
+                "contains no planning and never chooses an operation or CAD target."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "create_sketch",
+                            "create_extrude",
+                            "update_feature",
+                            "create_linear_pattern",
+                            "create_shell",
+                            "create_chamfer",
+                            "create_draft",
+                            "move_body",
+                        ],
+                        "description": "The one requested low-level feature operation.",
+                    },
+                    "request": {
+                        "type": "object",
+                        "description": (
+                            "The selected operation's normal arguments, including "
+                            "documentId/workspaceId/elementId. No second operation is allowed."
+                        ),
+                    },
+                    "responseMode": {
+                        "type": "string",
+                        "enum": ["compact", "diagnostic"],
+                        "default": "compact",
+                        "description": (
+                            "compact returns the shared bounded semantic result; diagnostic "
+                            "also retains the delegated tool's existing public result."
+                        ),
+                    },
+                },
+                "required": ["operation", "request"],
+            },
+        ),
+        Tool(
+            name="inspect_feature_compact",
+            description=(
+                "Inspect one feature from one authoritative Part Studio feature read. "
+                "Unlike inspect_feature, this one-shot path does not require a prior model "
+                "context handle. It returns bounded canonical parameters and never raw "
+                "feature payloads."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "documentId": {"type": "string"},
+                    "workspaceId": {"type": "string"},
+                    "elementId": {"type": "string"},
+                    "featureId": {"type": "string"},
+                    "includeParameters": {"type": "boolean", "default": True},
+                    "maxParameters": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 80,
+                        "default": 12,
+                    },
+                },
+                "required": ["documentId", "workspaceId", "elementId", "featureId"],
+            },
+        ),
+        Tool(
+            name="get_compact_model_state",
+            description=(
+                "Return a structured, bounded Part Studio state for agent reasoning: source "
+                "revision, regeneration summary, body identities, recent feature identities/"
+                "statuses/canonical parameters, known failures, requested changed feature IDs, "
+                "and explicit unknown/stale categories. Performs feature and parts reads only; "
+                "body topology and renders are intentionally not loaded."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "documentId": {"type": "string"},
+                    "workspaceId": {"type": "string"},
+                    "elementId": {"type": "string"},
+                    "recentFeatureLimit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 20,
+                    },
+                    "maxParametersPerFeature": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 16,
+                        "default": 8,
+                    },
+                    "changedFeatureIds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 32,
+                        "default": [],
+                    },
+                },
+                "required": ["documentId", "workspaceId", "elementId"],
+            },
+        ),
+        Tool(
+            name="get_execution_protocol_metrics",
+            description=(
+                "Return bounded process-local MCP invocation and serialized response-size "
+                "measurements, including explicitly labeled verification/resolution proxies. "
+                "No external telemetry is sent and no CAD call is made."
             ),
             inputSchema={
                 "type": "object",
@@ -3397,15 +3534,231 @@ async def _create_mate(
     )
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
-    """Handle tool calls."""
+async def _call_tool_impl(
+    name: str, arguments: Any
+) -> list[TextContent | ImageContent]:
+    """Dispatch one tool without counting nested adapter delegation as MCP I/O."""
 
     if name == "get_runtime_info":
         return [
             TextContent(
                 type="text",
                 text=json.dumps(get_runtime_info(), indent=2, sort_keys=True),
+            )
+        ]
+
+    elif name == "execute_feature":
+        try:
+            operation = arguments.get("operation")
+            request = arguments.get("request")
+            response_mode = arguments.get("responseMode", "compact")
+            if operation not in SUPPORTED_EXECUTION_OPERATIONS:
+                raise MutationPreflightError(
+                    f"Unsupported execute_feature operation: {operation!r}"
+                )
+            if not isinstance(request, dict):
+                raise MutationPreflightError("request must be an object")
+            missing_targets = [
+                key
+                for key in ("documentId", "workspaceId", "elementId")
+                if not isinstance(request.get(key), str) or not request.get(key)
+            ]
+            if missing_targets:
+                raise MutationPreflightError(
+                    f"request is missing non-empty target fields: {missing_targets}"
+                )
+            if response_mode not in {"compact", "diagnostic"}:
+                raise MutationPreflightError(
+                    "responseMode must be 'compact' or 'diagnostic'"
+                )
+        except MutationPreflightError as error:
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(
+                        error,
+                        tool_name=name,
+                        request_rejected=True,
+                    ),
+                )
+            ]
+
+        try:
+            delegated = await _delegate_feature_operation(operation, request)
+            if len(delegated) != 1 or not isinstance(delegated[0], TextContent):
+                raise ValueError(
+                    "Delegated feature operation did not return one structured text result"
+                )
+            legacy_result = json.loads(delegated[0].text)
+            if not isinstance(legacy_result, dict):
+                raise ValueError("Delegated feature result must be a JSON object")
+            compact = compact_execution_result(
+                operation,
+                request,
+                legacy_result,
+                response_mode=response_mode,
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(compact, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except Exception as error:
+            _log_unexpected_error("Unexpected error executing feature operation", error)
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(error, tool_name=name),
+                )
+            ]
+
+    elif name == "inspect_feature_compact":
+        try:
+            features_doc = await partstudio_manager.get_features(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+            )
+            feature = compact_feature(
+                features_doc,
+                arguments["featureId"],
+                include_parameters=bool(arguments.get("includeParameters", True)),
+                max_parameters=max(1, min(int(arguments.get("maxParameters", 12)), 80)),
+            )
+            payload = {
+                "contract": "jarvis.compact_feature.v1",
+                "target": {
+                    "document_id": arguments["documentId"][:128],
+                    "workspace_id": arguments["workspaceId"][:128],
+                    "element_id": arguments["elementId"][:128],
+                },
+                "source_revision": features_doc.get("sourceMicroversion"),
+                "feature": feature,
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except FeatureNotFoundError as error:
+            payload = {
+                "ok": False,
+                "error": {
+                    "type": "FEATURE_NOT_FOUND",
+                    "message": "Feature not found in authoritative Part Studio state",
+                    "feature_id": error.feature_id,
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except httpx.HTTPStatusError as error:
+            payload = {
+                "ok": False,
+                "error": {
+                    "type": "ONSHAPE_READ_FAILED",
+                    "message": "Unable to read authoritative feature state",
+                    "status_code": error.response.status_code,
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except Exception as error:
+            _log_unexpected_error("Unexpected compact feature inspection error", error)
+            payload = {
+                "ok": False,
+                "error": {
+                    "type": "COMPACT_INSPECTION_FAILED",
+                    "message": _safe_exception_message(error)[:256],
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+
+    elif name == "get_compact_model_state":
+        try:
+            target = {
+                "documentId": arguments["documentId"],
+                "workspaceId": arguments["workspaceId"],
+                "elementId": arguments["elementId"],
+            }
+            features_doc, parts = await asyncio.gather(
+                partstudio_manager.get_features(
+                    target["documentId"], target["workspaceId"], target["elementId"]
+                ),
+                partstudio_manager.get_parts(
+                    target["documentId"], target["workspaceId"], target["elementId"]
+                ),
+            )
+            payload = compact_model_state(
+                target=target,
+                features_doc=features_doc,
+                parts=parts,
+                recent_feature_limit=arguments.get("recentFeatureLimit", 20),
+                max_parameters_per_feature=arguments.get(
+                    "maxParametersPerFeature", 8
+                ),
+                changed_feature_ids=arguments.get("changedFeatureIds") or [],
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except httpx.HTTPStatusError as error:
+            payload = {
+                "ok": False,
+                "error": {
+                    "type": "ONSHAPE_READ_FAILED",
+                    "message": "Unable to read compact Part Studio state",
+                    "status_code": error.response.status_code,
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+        except Exception as error:
+            _log_unexpected_error("Unexpected compact model-state error", error)
+            payload = {
+                "ok": False,
+                "error": {
+                    "type": "COMPACT_MODEL_STATE_FAILED",
+                    "message": _safe_exception_message(error)[:256],
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+
+    elif name == "get_execution_protocol_metrics":
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    execution_protocol_metrics.snapshot(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             )
         ]
 
@@ -6615,6 +6968,39 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     else:
         raise ValueError(f"Unknown tool: {name}")
+
+
+async def _delegate_feature_operation(
+    operation: str, request: dict[str, Any]
+) -> list[TextContent | ImageContent]:
+    """Delegate one selected operation without creating a nested MCP invocation."""
+
+    return await _call_tool_impl(operation, request)
+
+
+def _serialized_content_bytes(contents: list[TextContent | ImageContent]) -> int:
+    total = 0
+    for content in contents:
+        if isinstance(content, TextContent):
+            total += len(content.text.encode("utf-8"))
+        elif isinstance(content, ImageContent):
+            data = content.data
+            total += len(data.encode("utf-8")) if isinstance(data, str) else len(data)
+    return total
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
+    """Measured outer MCP boundary; nested deterministic delegation is not recounted."""
+
+    result = await _call_tool_impl(name, arguments)
+    safe_arguments = arguments if isinstance(arguments, dict) else {}
+    execution_protocol_metrics.record(
+        name,
+        safe_arguments,
+        response_bytes=_serialized_content_bytes(result),
+    )
+    return result
 
 
 async def main_stdio():
