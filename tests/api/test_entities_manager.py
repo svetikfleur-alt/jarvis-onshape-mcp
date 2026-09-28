@@ -193,6 +193,84 @@ async def test_empty_bodydetails_returns_explicit_empty_summary():
 
 
 @pytest.mark.asyncio
+async def test_repeated_entity_reads_reuse_fresh_topology_snapshot():
+    client = _Client()
+    manager = EntityManager(client)
+
+    first = await manager.list_entities("D", "W", "E", kinds=["edges"])
+    second = await manager.list_entities("D", "W", "E", kinds=["edges"])
+
+    assert first["cache"] == {"bodydetails": "miss", "topology_state": "fresh"}
+    assert second["cache"] == {"bodydetails": "hit", "topology_state": "fresh"}
+    assert [call[0] for call in client.calls] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_missing_cached_reference_gets_one_authoritative_refresh():
+    client = _Client()
+    manager = EntityManager(client)
+    await manager.list_entities("D", "W", "E", kinds=["edges"])
+    refreshed = _bodydetails()
+    refreshed["bodies"][0]["faces"].append(
+        {
+            "id": "FACE-NEW",
+            "surface": {
+                "type": "plane",
+                "origin": _xyz(0, 0, 0.02),
+                "normal": _xyz(0, 0, 1),
+            },
+        }
+    )
+    client.bodydetails = refreshed
+
+    validation = await manager.validate_entity_ids(
+        "D", "W", "E", kind="faces", entity_ids=["FACE-NEW"]
+    )
+
+    assert validation == {
+        "valid": True,
+        "missing_ids": [],
+        "refreshed": True,
+        "topology_state": "fresh",
+    }
+    assert [call[0] for call in client.calls] == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_invalidated_topology_refreshes_once_and_ambiguity_fails_closed():
+    client = _Client()
+    manager = EntityManager(client)
+    await manager.list_entities("D", "W", "E", kinds=["edges"])
+    assert manager.invalidate("D", "W", "E") is True
+    client.bodydetails = {"bodies": []}
+
+    validation = await manager.validate_entity_ids(
+        "D", "W", "E", kind="faces", entity_ids=["FACE-MISSING"]
+    )
+
+    assert validation == {
+        "valid": False,
+        "missing_ids": ["FACE-MISSING"],
+        "refreshed": True,
+        "topology_state": "fresh",
+    }
+    assert [call[0] for call in client.calls] == ["GET", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_invalidation_evicts_each_cached_part_studio():
+    client = _Client()
+    manager = EntityManager(client)
+    await manager.list_entities("D", "W", "E1", kinds=["edges"])
+    await manager.list_entities("D", "W", "E2", kinds=["edges"])
+
+    assert manager.invalidate_workspace("D", "W") == 2
+    await manager.list_entities("D", "W", "E1", kinds=["edges"])
+
+    assert [call[0] for call in client.calls] == ["GET", "GET", "GET"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

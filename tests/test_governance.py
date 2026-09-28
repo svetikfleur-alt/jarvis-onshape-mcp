@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import onshape_mcp.server as server
-from onshape_mcp.governance import BudgetPolicy, ContextStore
+from onshape_mcp.governance import BudgetPolicy, ContextStore, GovernanceBudgetError
 from onshape_mcp.server import call_tool, list_tools
 
 
@@ -52,6 +52,170 @@ def test_budget_policy_uses_pilot_defaults():
     assert policy.max_consecutive_reads == 4
     assert policy.max_inline_bytes == 32768
     assert policy.max_feature_rows == 50
+
+
+def test_authoritative_feature_delta_refreshes_only_matching_context():
+    store = ContextStore()
+    target = store.create("doc", "ws", "part-studio")
+    unrelated = store.create("other-doc", "other-ws", "other-element")
+    original = _feature_payload(2)
+    other_original = _feature_payload(1)
+    store.store_features(target.working_state.context_handle, original)
+    store.store_features(unrelated.working_state.context_handle, other_original)
+    store.get_feature_index(target.working_state.context_handle)
+
+    summary = store.apply_authoritative_feature_delta(
+        "doc",
+        "ws",
+        "part-studio",
+        {
+            "features": [
+                {
+                    **original["features"][0],
+                    "name": "Updated feature",
+                }
+            ],
+            "featureStates": {"feature-0": {"featureStatus": "OK"}},
+            "sourceMicroversion": "microversion-2",
+        },
+    )
+
+    refreshed = store.get(target.working_state.context_handle)
+    assert summary == {
+        "contexts_updated": 1,
+        "feature_ids": ["feature-0"],
+        "feature_cache": "partially_refreshed",
+        "topology_cache": "invalidated",
+    }
+    assert refreshed.working_state.model_ref.document_id == "doc"
+    assert refreshed.working_state.model_ref.workspace_id == "ws"
+    assert refreshed.working_state.model_ref.element_id == "part-studio"
+    assert refreshed.working_state.revision_id is None
+    assert [item["name"] for item in refreshed.raw_features["features"]] == [
+        "Updated feature",
+        "Feature 1",
+    ]
+    assert refreshed.feature_index is None
+    assert refreshed.cache_metadata["state"] == "partial"
+    assert refreshed.cache_metadata["index_state"] == "empty"
+    assert refreshed.cache_metadata["topology_state"] == "stale"
+    assert refreshed.cache_metadata["invalidations"] == 1
+    assert refreshed.cache_metadata["fresh_feature_ids"] == ["feature-0"]
+    assert refreshed.cache_metadata["delta_revision_id"] == "microversion-2"
+    assert store.get(unrelated.working_state.context_handle).raw_features is other_original
+
+
+def test_authoritative_created_feature_is_added_without_discarding_cached_tree():
+    store = ContextStore()
+    record = store.create("doc", "ws", "part-studio")
+    original = _feature_payload(1)
+    store.store_features(record.working_state.context_handle, original)
+
+    store.apply_authoritative_feature_delta(
+        "doc",
+        "ws",
+        "part-studio",
+        {
+            "features": [
+                {
+                    "featureId": "feature-created",
+                    "featureType": "shell",
+                    "name": "Shell",
+                    "parameters": [],
+                }
+            ],
+            "featureStates": {"feature-created": {"featureStatus": "OK"}},
+        },
+        created_feature_ids=["feature-created"],
+    )
+
+    refreshed = store.get(record.working_state.context_handle)
+    assert [item["featureId"] for item in refreshed.raw_features["features"]] == [
+        "feature-0",
+        "feature-created",
+    ]
+    assert refreshed.cache_metadata["feature_count"] == 2
+    assert refreshed.cache_metadata["state"] == "ready"
+
+
+def test_authoritative_topology_refresh_clears_only_matching_stale_marker():
+    store = ContextStore()
+    target = store.create("doc", "ws", "part-studio")
+    other = store.create("other", "ws", "part-studio")
+    store.store_features(target.working_state.context_handle, _feature_payload(1))
+    store.store_features(other.working_state.context_handle, _feature_payload(1))
+    store.invalidate_model("doc", "ws", "part-studio")
+
+    updated = store.mark_topology_fresh("doc", "ws", "part-studio")
+
+    assert updated == 1
+    assert store.get(target.working_state.context_handle).cache_metadata[
+        "topology_state"
+    ] == "fresh"
+    assert store.get(other.working_state.context_handle).cache_metadata[
+        "topology_state"
+    ] == "unknown"
+
+
+def test_invalidated_feature_context_cannot_serve_stale_index():
+    store = ContextStore()
+    record = store.create("doc", "ws", "part-studio")
+    store.store_features(record.working_state.context_handle, _feature_payload(1))
+    store.get_feature_index(record.working_state.context_handle)
+    store.invalidate_model("doc", "ws", "part-studio")
+
+    with pytest.raises(GovernanceBudgetError) as error:
+        store.get_feature_index(record.working_state.context_handle)
+
+    assert error.value.error_type == "CONTEXT_STATE_STALE"
+
+
+def test_full_authoritative_snapshot_removes_deleted_feature_from_context():
+    store = ContextStore()
+    record = store.create("doc", "ws", "part-studio")
+    store.store_features(record.working_state.context_handle, _feature_payload(2))
+
+    summary = store.replace_authoritative_snapshot(
+        "doc",
+        "ws",
+        "part-studio",
+        {
+            "features": [_feature_payload(2)["features"][1]],
+            "featureStates": {"feature-1": {"featureStatus": "OK"}},
+            "sourceMicroversion": "after-delete",
+        },
+        affected_feature_ids=["feature-0"],
+    )
+
+    refreshed = store.get(record.working_state.context_handle)
+    assert summary == {
+        "contexts_updated": 1,
+        "feature_ids": ["feature-0"],
+        "feature_cache": "refreshed",
+        "topology_cache": "invalidated",
+    }
+    assert [item["featureId"] for item in refreshed.raw_features["features"]] == [
+        "feature-1"
+    ]
+    assert refreshed.working_state.revision_id == "after-delete"
+    assert refreshed.cache_metadata["state"] == "ready"
+    assert refreshed.cache_metadata["topology_state"] == "stale"
+
+
+def test_workspace_invalidation_marks_all_matching_part_studio_contexts_stale():
+    store = ContextStore()
+    first = store.create("doc", "ws", "part-a")
+    second = store.create("doc", "ws", "part-b")
+    unrelated = store.create("other", "ws", "part-c")
+    for record in (first, second, unrelated):
+        store.store_features(record.working_state.context_handle, _feature_payload(1))
+
+    updated = store.invalidate_workspace("doc", "ws")
+
+    assert updated == 2
+    assert store.get(first.working_state.context_handle).cache_metadata["state"] == "stale"
+    assert store.get(second.working_state.context_handle).cache_metadata["state"] == "stale"
+    assert store.get(unrelated.working_state.context_handle).cache_metadata["state"] == "ready"
 
 
 @pytest.mark.asyncio

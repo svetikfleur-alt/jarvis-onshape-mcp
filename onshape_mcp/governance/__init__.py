@@ -32,12 +32,16 @@ from .models import (
     WorkingStateValidationError,
     serialize_bounded,
 )
+from .hygiene import DocumentHygieneTracker
+from .metrics import ExecutionMetrics
 
 __all__ = [
     "BudgetPolicy",
     "BudgetState",
     "ContextNotFoundError",
     "ContextStore",
+    "DocumentHygieneTracker",
+    "ExecutionMetrics",
     "FeatureIndex",
     "FeatureNotFoundError",
     "GovernanceBudgetError",

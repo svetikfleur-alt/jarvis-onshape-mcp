@@ -361,11 +361,77 @@ class EntityManager:
     payloads as BTMIndividualQuery-138 deterministicIds.
     """
 
-    def __init__(self, client: OnshapeClient):
+    def __init__(self, client: OnshapeClient, *, metrics: Optional[Any] = None):
         self.client = client
+        self.metrics = metrics
+        self._bodydetails_cache: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        self._face_frames_cache: Dict[
+            tuple[str, str, str], Dict[str, Dict[str, List[float]]]
+        ] = {}
+
+    @staticmethod
+    def _cache_key(
+        document_id: str, workspace_id: str, element_id: str
+    ) -> tuple[str, str, str]:
+        return document_id, workspace_id, element_id
+
+    def invalidate(self, document_id: str, workspace_id: str, element_id: str) -> bool:
+        """Invalidate only topology evidence for one Part Studio."""
+
+        key = self._cache_key(document_id, workspace_id, element_id)
+        existed = key in self._bodydetails_cache or key in self._face_frames_cache
+        self._bodydetails_cache.pop(key, None)
+        self._face_frames_cache.pop(key, None)
+        if existed and self.metrics is not None:
+            self.metrics.record_cache("invalidation")
+        return existed
+
+    def invalidate_workspace(self, document_id: str, workspace_id: str) -> int:
+        """Evict every cached Part Studio in a workspace after variable changes."""
+
+        keys = {
+            key
+            for key in set(self._bodydetails_cache) | set(self._face_frames_cache)
+            if key[0] == document_id and key[1] == workspace_id
+        }
+        for key in keys:
+            self._bodydetails_cache.pop(key, None)
+            self._face_frames_cache.pop(key, None)
+            if self.metrics is not None:
+                self.metrics.record_cache("invalidation")
+        return len(keys)
+
+    async def _get_body_details(
+        self,
+        document_id: str,
+        workspace_id: str,
+        element_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[Dict[str, Any], bool]:
+        key = self._cache_key(document_id, workspace_id, element_id)
+        if not force_refresh and key in self._bodydetails_cache:
+            if self.metrics is not None:
+                self.metrics.record_cache("hit")
+            return self._bodydetails_cache[key], True
+        path = (
+            f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/bodydetails"
+        )
+        raw = await self.client.get(path)
+        if self.metrics is not None:
+            self.metrics.record_cache("miss")
+        self._bodydetails_cache[key] = raw if isinstance(raw, dict) else {}
+        if force_refresh:
+            self._face_frames_cache.pop(key, None)
+        return self._bodydetails_cache[key], False
 
     async def _fetch_face_frames(
-        self, document_id: str, workspace_id: str, element_id: str
+        self,
+        document_id: str,
+        workspace_id: str,
+        element_id: str,
+        *,
+        force_refresh: bool = False,
     ) -> Dict[str, Dict[str, List[float]]]:
         """Run FeatureScript to get face_id -> {normal, x, y} world-frame.
 
@@ -379,14 +445,76 @@ class EntityManager:
         Returns an empty dict on failure so the caller can fall back to
         plane-defining normals; frame enrichment is best-effort.
         """
+        key = self._cache_key(document_id, workspace_id, element_id)
+        if not force_refresh and key in self._face_frames_cache:
+            return self._face_frames_cache[key]
         path = (
             f"/api/v8/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/featurescript"
         )
         try:
             resp = await self.client.post(path, data={"script": _FACE_FRAMES_FS})
-            return _parse_fs_frame_map(resp)
+            frames = _parse_fs_frame_map(resp)
         except Exception:  # noqa: BLE001
-            return {}
+            frames = {}
+        self._face_frames_cache[key] = frames
+        return frames
+
+    @staticmethod
+    def _entity_ids(raw: Dict[str, Any], kind: str) -> set[str]:
+        found: set[str] = set()
+        for body in raw.get("bodies") or []:
+            if not isinstance(body, dict):
+                continue
+            if kind == "bodies":
+                body_id = body.get("id")
+                if isinstance(body_id, str) and body_id:
+                    found.add(body_id)
+                continue
+            for entity in body.get(kind) or []:
+                if isinstance(entity, dict):
+                    entity_id = entity.get("id")
+                    if isinstance(entity_id, str) and entity_id:
+                        found.add(entity_id)
+        return found
+
+    async def validate_entity_ids(
+        self,
+        document_id: str,
+        workspace_id: str,
+        element_id: str,
+        *,
+        kind: str,
+        entity_ids: List[str],
+    ) -> Dict[str, Any]:
+        """Validate references, refreshing a stale/missing cache at most once."""
+
+        if kind not in {"bodies", "faces", "edges", "vertices"}:
+            raise ValueError("kind must be bodies, faces, edges, or vertices")
+        if not entity_ids or not all(isinstance(item, str) and item for item in entity_ids):
+            raise ValueError("entity_ids must be a non-empty list of IDs")
+
+        raw, cache_hit = await self._get_body_details(
+            document_id, workspace_id, element_id
+        )
+        refreshed = not cache_hit
+        available = self._entity_ids(raw, kind)
+        missing = sorted(set(entity_ids) - available)
+        if missing and cache_hit:
+            raw, _ = await self._get_body_details(
+                document_id,
+                workspace_id,
+                element_id,
+                force_refresh=True,
+            )
+            refreshed = True
+            available = self._entity_ids(raw, kind)
+            missing = sorted(set(entity_ids) - available)
+        return {
+            "valid": not missing,
+            "missing_ids": missing,
+            "refreshed": refreshed,
+            "topology_state": "fresh",
+        }
 
     async def list_entities(
         self,
@@ -402,6 +530,7 @@ class EntityManager:
         at_z_tol_mm: float = 0.5,
         radius_range_mm: Optional[List[float]] = None,
         length_range_mm: Optional[List[float]] = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """Return structured, enriched entity lists for all bodies in the PS.
 
@@ -458,14 +587,21 @@ class EntityManager:
         if length_range_mm is not None and len(length_range_mm) != 2:
             raise ValueError("length_range_mm must be a [min, max] pair")
 
-        path = (
-            f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/bodydetails"
+        raw, cache_hit = await self._get_body_details(
+            document_id,
+            workspace_id,
+            element_id,
+            force_refresh=force_refresh,
         )
-        raw = await self.client.get(path)
         bodies_raw = raw.get("bodies") or []
 
         face_frames: Dict[str, Dict[str, List[float]]] = (
-            await self._fetch_face_frames(document_id, workspace_id, element_id)
+            await self._fetch_face_frames(
+                document_id,
+                workspace_id,
+                element_id,
+                force_refresh=force_refresh,
+            )
             if "faces" in wanted
             else {}
         )
@@ -562,4 +698,8 @@ class EntityManager:
             "filters": filters_echo,
             "original_counts": original_counts,
             "filtered_counts": filtered_counts,
+            "cache": {
+                "bodydetails": "hit" if cache_hit else "miss",
+                "topology_state": "fresh",
+            },
         }

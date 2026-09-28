@@ -43,6 +43,24 @@ class TestPartStudioManager:
         assert "/features" in path
 
     @pytest.mark.asyncio
+    async def test_get_features_can_request_one_authoritative_feature(
+        self, partstudio_manager, onshape_client, sample_document_ids
+    ):
+        onshape_client.get = AsyncMock(return_value={"features": []})
+
+        await partstudio_manager.get_features(
+            sample_document_ids["document_id"],
+            sample_document_ids["workspace_id"],
+            sample_document_ids["element_id"],
+            feature_ids=["feature-safe"],
+        )
+
+        assert onshape_client.get.await_count == 1
+        assert onshape_client.get.await_args.kwargs == {
+            "params": {"featureId": ["feature-safe"]}
+        }
+
+    @pytest.mark.asyncio
     async def test_add_feature_success(
         self, partstudio_manager, onshape_client, sample_document_ids, sample_feature_response
     ):

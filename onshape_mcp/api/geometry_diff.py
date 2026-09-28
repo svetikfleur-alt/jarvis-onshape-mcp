@@ -32,7 +32,7 @@ def _vec(d: Optional[Dict[str, Any]]) -> Optional[List[float]]:
 
 
 def _face_signature(face: Dict[str, Any]) -> Tuple:
-    """Identity tuple for a face — id + surface type + rounded origin.
+    """Identity tuple for a face, preferring its deterministic ID.
 
     Not immune to id-drift across regens, but good enough for the common
     case (feature appended, prior faces keep ids). A perfect identity
@@ -40,19 +40,25 @@ def _face_signature(face: Dict[str, Any]) -> Tuple:
     when id-drift shows up as a real failure.
     """
     surface = face.get("surface") or {}
+    face_id = face.get("id")
+    if face_id:
+        return (face_id, surface.get("type"))
     origin = _vec(surface.get("origin"))
     origin_key = tuple(round(c, 6) for c in origin) if origin else None
-    return (face.get("id"), surface.get("type"), origin_key)
+    return (None, surface.get("type"), origin_key)
 
 
 def _edge_signature(edge: Dict[str, Any]) -> Tuple:
     geom = edge.get("geometry") or {}
     curve = edge.get("curve") or {}
+    edge_id = edge.get("id")
+    if edge_id:
+        return (edge_id, curve.get("type"))
     start = _vec(geom.get("startPoint"))
     end = _vec(geom.get("endPoint"))
     key_start = tuple(round(c, 6) for c in start) if start else None
     key_end = tuple(round(c, 6) for c in end) if end else None
-    return (edge.get("id"), curve.get("type"), key_start, key_end)
+    return (None, curve.get("type"), key_start, key_end)
 
 
 def _face_map(bodies: List[Dict[str, Any]]) -> Dict[Any, Dict[str, Any]]:
@@ -276,6 +282,12 @@ def compute_diff(
         parts.append(
             f"bodies {out['body_count_before']} → {out['body_count_after']}"
         )
+    if (
+        not parts
+        and out.get("bbox_before_mm") != out.get("bbox_after_mm")
+        and ("bbox_before_mm" in out or "bbox_after_mm" in out)
+    ):
+        parts.append("bounding box changed")
     out["summary"] = "; ".join(parts) if parts else "no visible change"
 
     return out

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Literal, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from ..builders._units import parse_angle, parse_length
 from .client import OnshapeClient
 from .request_guard import safe_exception_message
 
@@ -32,6 +33,8 @@ MutationVerification = Literal["verified", "unverified", "no_effect", "failed"]
 _CONCRETE_QUANTITY_EXPRESSION = re.compile(
     r"^\s*[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?\s+[^#\s]+\s*$"
 )
+
+_NON_SEMANTIC_WIRE_FIELDS = frozenset({"nodeId", "parameterName"})
 
 
 class MutationPreflightError(ValueError):
@@ -64,6 +67,7 @@ class FeatureApplyResult(BaseModel):
     verification_scope: str = "none"
     reason_code: Optional[str] = None
     verification_message: Optional[str] = None
+    invalidation: Optional[Dict[str, Any]] = None
     # Structured HTTP diagnostics cross the MCP boundary only through the
     # dedicated sanitized exception projection, never as an arbitrary dict.
     diagnostic: Optional[Dict[str, Any]] = Field(
@@ -83,7 +87,7 @@ class FeatureApplyResult(BaseModel):
             and self.regen_ok is True
             and self.mutation_verification == "verified"
         )
-        return {
+        result = {
             "ok": semantic_ok,
             "status": self.status,
             "feature_id": self.feature_id,
@@ -99,6 +103,9 @@ class FeatureApplyResult(BaseModel):
             "reason_code": self.reason_code,
             "verification_message": self.verification_message,
         }
+        if self.invalidation is not None:
+            result["invalidation"] = self.invalidation
+        return result
 
 
 def _normalize_status(raw_status: Any) -> FeatureStatus:
@@ -141,14 +148,11 @@ def _quantity_value_proves_expression_equivalence(
     """Use canonical numeric truth only for two concrete quantity literals."""
     if not (isinstance(bt_type, str) and bt_type.startswith("BTMParameterQuantity-")):
         return False
-    expected_expression = expected.get("expression")
-    actual_expression = actual.get("expression")
-    if not (
-        isinstance(expected_expression, str)
-        and isinstance(actual_expression, str)
-        and _CONCRETE_QUANTITY_EXPRESSION.fullmatch(expected_expression)
-        and _CONCRETE_QUANTITY_EXPRESSION.fullmatch(actual_expression)
-    ):
+    expected_quantity = _concrete_quantity(expected.get("expression"))
+    actual_quantity = _concrete_quantity(actual.get("expression"))
+    if expected_quantity is None or actual_quantity is None:
+        return False
+    if expected_quantity[0] != actual_quantity[0]:
         return False
     expected_value = expected.get("value")
     actual_value = actual.get("value")
@@ -159,12 +163,61 @@ def _quantity_value_proves_expression_equivalence(
         or not isinstance(actual_value, (int, float))
     ):
         return False
-    return math.isclose(
-        float(expected_value),
-        float(actual_value),
-        rel_tol=1e-9,
-        abs_tol=1e-12,
+    return (
+        math.isclose(
+            expected_quantity[1],
+            actual_quantity[1],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            float(expected_value),
+            expected_quantity[1],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            float(actual_value),
+            actual_quantity[1],
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
     )
+
+
+def _bt_type_family(value: Any) -> Optional[str]:
+    """Strip Onshape's version suffix while preserving the structural type."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    return value.rsplit("-", 1)[0]
+
+
+def _concrete_quantity(expression: Any) -> Optional[tuple[str, float]]:
+    """Return dimensional kind plus SI truth for a concrete literal."""
+
+    if not (
+        isinstance(expression, str)
+        and _CONCRETE_QUANTITY_EXPRESSION.fullmatch(expression)
+    ):
+        return None
+    for kind, parser, attribute in (
+        ("length", parse_length, "meters"),
+        ("angle", parse_angle, "radians"),
+    ):
+        try:
+            return kind, float(getattr(parser(expression), attribute))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _same_unordered_scalars(expected: Any, actual: Any) -> Optional[bool]:
+    if not isinstance(expected, list) or not isinstance(actual, list):
+        return None
+    if not all(isinstance(item, str) for item in expected + actual):
+        return None
+    return sorted(expected) == sorted(actual)
 
 
 def _is_feature_reference_query(bt_type: Optional[str]) -> bool:
@@ -200,6 +253,10 @@ def _requested_subset_compare(
         quantity_equivalent = _quantity_value_proves_expression_equivalence(
             expected, actual, current_bt_type
         )
+        expected_family = _bt_type_family(expected.get("btType"))
+        actual_family = _bt_type_family(actual.get("btType"))
+        if expected_family and actual_family and expected_family != actual_family:
+            return False
         feature_reference_query = _is_feature_reference_query(current_bt_type)
         matching_feature_reference = (
             feature_reference_query
@@ -207,12 +264,24 @@ def _requested_subset_compare(
             and bool(expected.get("featureId"))
             and expected.get("featureId") == actual.get("featureId")
         )
+        deterministic_ids_match = bool(expected.get("deterministicIds")) and (
+            _same_unordered_scalars(
+                expected.get("deterministicIds"), actual.get("deterministicIds")
+            )
+            is True
+        )
         for key, expected_value in expected.items():
-            if key == "nodeId" or (key == "featureId" and not feature_reference_query):
+            if key in _NON_SEMANTIC_WIRE_FIELDS or key == "btType":
+                continue
+            if key == "namespace" and not expected_value:
+                continue
+            if key == "featureId" and not feature_reference_query:
                 continue
             if quantity_equivalent and key in {"expression", "units"}:
                 continue
-            if matching_feature_reference and key in {"queryString", "queryStatement"}:
+            if (
+                matching_feature_reference or deterministic_ids_match
+            ) and key in {"queryString", "queryStatement"}:
                 continue
             if key not in actual:
                 return None
@@ -244,6 +313,8 @@ def _requested_subset_compare(
                 if compared is not True:
                     return compared
             return True
+        if field_name in {"deterministicIds", "featureIds"}:
+            return _same_unordered_scalars(expected, actual)
         if len(expected) != len(actual):
             return None
         for expected_item, actual_item in zip(expected, actual):
@@ -274,11 +345,27 @@ def _requested_update_compare(
             continue
         if key not in parameter:
             return None
+        if (
+            key == "expression"
+            and _bt_type_family(parameter.get("btType")) != "BTMParameterQuantity"
+        ):
+            return None
         if not _scalar_equal(expected, parameter[key]):
-            # Quantity expressions are frequently canonicalized into another
-            # equivalent representation. A mismatch is therefore ambiguous,
-            # while exact equality is safe to verify.
             if key == "expression":
+                expected_quantity = _concrete_quantity(expected)
+                actual_quantity = _concrete_quantity(parameter[key])
+                if expected_quantity is not None and actual_quantity is not None:
+                    if expected_quantity[0] != actual_quantity[0]:
+                        return False
+                    if not math.isclose(
+                        expected_quantity[1],
+                        actual_quantity[1],
+                        rel_tol=1e-9,
+                        abs_tol=1e-12,
+                    ):
+                        return False
+                    continue
+                # Variable/expression evaluation is not available here.
                 return None
             return False
     return True
@@ -392,7 +479,12 @@ async def apply_feature_and_check(
         )
 
     try:
-        features_after = await client.get(base)
+        if getattr(client, "metrics", None) is not None:
+            client.metrics.record_semantic_verification_read()
+        features_after = await client.get(
+            base,
+            params={"featureId": [real_feature_id]} if real_feature_id else None,
+        )
     except Exception as error:  # noqa: BLE001
         logger.warning(
             "apply_feature_and_check: authoritative feature reread failed ({})",
@@ -765,7 +857,7 @@ async def update_feature_params_and_check(
     base = (
         f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/features"
     )
-    features_doc = await client.get(base)
+    features_doc = await client.get(base, params={"featureId": [feature_id]})
     features: List[Dict[str, Any]] = features_doc.get("features", []) or []
 
     target: Optional[Dict[str, Any]] = None
@@ -915,6 +1007,26 @@ async def update_feature_params_and_check(
             if key not in before_param or key not in after_param:
                 unchanged = False
                 break
+            if (
+                key == "expression"
+                and _bt_type_family(before_param.get("btType"))
+                == "BTMParameterQuantity"
+                and _bt_type_family(after_param.get("btType"))
+                == "BTMParameterQuantity"
+                and isinstance(before_param.get("value"), (int, float))
+                and not isinstance(before_param.get("value"), bool)
+                and isinstance(after_param.get("value"), (int, float))
+                and not isinstance(after_param.get("value"), bool)
+            ):
+                if not math.isclose(
+                    float(before_param["value"]),
+                    float(after_param["value"]),
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                ):
+                    unchanged = False
+                    break
+                continue
             if not _scalar_equal(before_param[key], after_param[key]):
                 unchanged = False
                 break

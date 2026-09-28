@@ -168,3 +168,73 @@ def test_negative_volume_delta_is_not_prefixed_with_plus() -> None:
     )
 
     assert result["summary"] == "volume -1000.0 mm³"
+
+
+def test_translation_keeps_stable_topology_ids_out_of_added_removed_lists() -> None:
+    before = [
+        {
+            "id": "BODY-A",
+            "faces": [
+                {
+                    "id": "FACE-A",
+                    "surface": {
+                        "type": "plane",
+                        "origin": _point(0.0, 0.0, 0.0),
+                        "normal": _point(0.0, 0.0, 1.0),
+                    },
+                }
+            ],
+            "edges": [
+                {
+                    "id": "EDGE-A",
+                    "curve": {"type": "line"},
+                    "geometry": {
+                        "startPoint": _point(0.0, 0.0, 0.0),
+                        "endPoint": _point(0.01, 0.0, 0.0),
+                    },
+                }
+            ],
+            "vertices": [
+                {"id": "VERTEX-A", "point": _point(0.0, 0.0, 0.0)},
+                {"id": "VERTEX-B", "point": _point(0.01, 0.0, 0.0)},
+            ],
+        }
+    ]
+    after = [
+        {
+            "id": "BODY-A",
+            "faces": [
+                {
+                    "id": "FACE-A",
+                    "surface": {
+                        "type": "plane",
+                        "origin": _point(0.02, 0.0, 0.0),
+                        "normal": _point(0.0, 0.0, 1.0),
+                    },
+                }
+            ],
+            "edges": [
+                {
+                    "id": "EDGE-A",
+                    "curve": {"type": "line"},
+                    "geometry": {
+                        "startPoint": _point(0.02, 0.0, 0.0),
+                        "endPoint": _point(0.03, 0.0, 0.0),
+                    },
+                }
+            ],
+            "vertices": [
+                {"id": "VERTEX-A", "point": _point(0.02, 0.0, 0.0)},
+                {"id": "VERTEX-B", "point": _point(0.03, 0.0, 0.0)},
+            ],
+        }
+    ]
+
+    result = compute_diff(before, after)
+
+    assert result["faces_added"] == []
+    assert result["faces_removed"] == []
+    assert result["edges_added"] == []
+    assert result["edges_removed"] == []
+    assert result["bbox_before_mm"] != result["bbox_after_mm"]
+    assert result["summary"] == "bounding box changed"

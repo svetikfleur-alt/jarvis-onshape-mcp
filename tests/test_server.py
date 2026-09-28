@@ -217,6 +217,76 @@ def test_feature_apply_json_never_serializes_internal_raw_poison():
         assert poison not in rendered
 
 
+def test_feature_apply_json_compacts_large_topology_change_lists():
+    result = _mock_apply_result(feature_type="transform")
+    result.changes = {
+        "body_count_before": 1,
+        "body_count_after": 1,
+        "bbox_before_mm": {"x_min_mm": 0.0, "x_max_mm": 10.0},
+        "bbox_after_mm": {"x_min_mm": 20.0, "x_max_mm": 30.0},
+        "faces_added": [
+            {"id": f"face-{index}", "type": "PLANE", "description": "face"}
+            for index in range(100)
+        ],
+        "faces_removed": [
+            {"id": f"old-face-{index}", "type": "PLANE", "description": "face"}
+            for index in range(100)
+        ],
+        "edges_added": [
+            {"id": f"edge-{index}", "type": "LINE"} for index in range(100)
+        ],
+        "edges_removed": [],
+        "summary": "faces +100/-100; edges +100/-0",
+    }
+
+    rendered = _feature_apply_json(result, tool_name="move_body")
+    payload = __import__("json").loads(rendered)
+
+    assert len(rendered.encode("utf-8")) < 5000
+    assert payload["changes"]["faces_added_count"] == 100
+    assert payload["changes"]["faces_removed_count"] == 100
+    assert payload["changes"]["edges_added_count"] == 100
+    assert len(payload["changes"]["faces_added_sample"]) == 8
+    assert payload["changes"]["truncated"] is True
+    assert len(result.changes["faces_added"]) == 100
+
+
+def test_verified_mutation_does_not_request_a_verification_only_followup():
+    payload = __import__("json").loads(
+        _feature_apply_json(_mock_apply_result(), tool_name="create_extrude")
+    )
+
+    assert any("already authoritatively verified" in hint for hint in payload["hints"])
+    assert all("describe_part_studio" not in hint for hint in payload["hints"])
+
+
+def test_failed_requested_state_with_ok_regen_does_not_get_verified_hint():
+    from onshape_mcp.api.feature_apply import FeatureApplyResult
+
+    result = FeatureApplyResult(
+        ok=False,
+        status="OK",
+        feature_id="feature",
+        feature_name="Feature",
+        feature_type="extrude",
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=True,
+        mutation_verification="failed",
+        changed=True,
+        verification_scope="feature_state",
+        reason_code="REQUESTED_STATE_MISMATCH",
+        verification_message="Requested state differs.",
+    )
+
+    payload = __import__("json").loads(
+        _feature_apply_json(result, tool_name="create_extrude")
+    )
+
+    assert any("requested state mismatch" in hint.lower() for hint in payload["hints"])
+    assert all("already authoritatively verified" not in hint for hint in payload["hints"])
+
+
 def test_exception_json_uses_sanitized_http_diagnostic_not_raw_response():
     private_doc = "PRIVATE_DOCUMENT_CANARY"
     private_workspace = "PRIVATE_WORKSPACE_CANARY"

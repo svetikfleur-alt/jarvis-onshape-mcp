@@ -307,6 +307,19 @@ def inspect_sketch(
 
     entities = [_summarize_entity(e) for e in feature.get("entities") or []]
     constraints = [_summarize_constraint(c) for c in feature.get("constraints") or []]
+    constraint_quality = {
+        "authoritative_status_available": False,
+        "fully_constrained": None,
+        "degrees_of_freedom": None,
+        "entity_count": len(entities),
+        "constraint_count": len(constraints),
+        "production_complete": None,
+        "quality_state": "UNVERIFIED",
+        "reason": (
+            "The authoritative feature response does not expose sketch degrees "
+            "of freedom or fully-constrained status."
+        ),
+    }
 
     # Group entities by kind for a tidier display.
     header = (
@@ -327,7 +340,12 @@ def inspect_sketch(
     else:
         con_lines = ["CONSTRAINTS: none"]
 
-    text = "\n".join([header] + entity_lines + [""] + con_lines)
+    quality_lines = [
+        "",
+        "CONSTRAINT QUALITY: UNVERIFIED",
+        "  Fully constrained / degrees of freedom are not exposed by this authoritative read.",
+    ]
+    text = "\n".join([header] + entity_lines + [""] + con_lines + quality_lines)
 
     return {
         "name": name,
@@ -336,6 +354,7 @@ def inspect_sketch(
         "plane_query": plane_ids,
         "entities": entities,
         "constraints": constraints,
+        "constraint_quality": constraint_quality,
         "text": text,
     }
 

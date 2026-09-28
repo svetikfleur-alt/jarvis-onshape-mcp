@@ -59,7 +59,9 @@ _COLLECTION_IDENTIFIERS = {
     "translations": "translationId",
 }
 _SAFE_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
-_SAFE_SCENARIOS = frozenset({"LIVE-DEEP-READ-01"})
+_SAFE_SCENARIOS = frozenset(
+    {"LIVE-DEEP-READ-01", "LIVE-OPTIMIZATION-VALIDATION"}
+)
 _GENERIC_SCENARIO = "LIVE-SCENARIO"
 
 

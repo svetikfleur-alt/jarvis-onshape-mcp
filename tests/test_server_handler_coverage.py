@@ -17,7 +17,7 @@ import pytest
 from onshape_mcp.api.feature_apply import FeatureApplyResult
 from onshape_mcp.api.sketch_edit import CascadedRemoval, EditSketchResult
 from onshape_mcp.builders.sketch import SketchPlane
-from onshape_mcp.governance import ContextStore
+from onshape_mcp.governance import ContextStore, DocumentHygieneTracker
 import onshape_mcp.server as server
 
 
@@ -182,6 +182,297 @@ async def _start_model_context(monkeypatch: pytest.MonkeyPatch) -> tuple[str, As
     monkeypatch.setattr(server.partstudio_manager, "get_features", get_features)
     payload = _json_payload(await server.call_tool("start_model_context", BASE_IDS))
     return payload["context_handle"], get_features
+
+
+@pytest.mark.asyncio
+async def test_face_sketch_preflight_refreshes_reference_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = AsyncMock(
+        return_value={
+            "valid": True,
+            "missing_ids": [],
+            "refreshed": True,
+            "topology_state": "fresh",
+        }
+    )
+    monkeypatch.setattr(server.entity_manager, "validate_entity_ids", validate)
+
+    plane_id, plane, warnings = await server._resolve_sketch_plane_id(
+        {**BASE_IDS, "faceId": "face-safe"}
+    )
+
+    assert plane_id == "face-safe"
+    assert plane is SketchPlane.FRONT
+    assert warnings == [
+        "Topology evidence was refreshed before accepting `faceId`."
+    ]
+    validate.assert_awaited_once_with(
+        "doc-safe",
+        "workspace-safe",
+        "element-safe",
+        kind="faces",
+        entity_ids=["face-safe"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_face_sketch_preflight_fails_closed_after_one_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = AsyncMock(
+        return_value={
+            "valid": False,
+            "missing_ids": ["face-missing"],
+            "refreshed": True,
+            "topology_state": "fresh",
+        }
+    )
+    monkeypatch.setattr(server.entity_manager, "validate_entity_ids", validate)
+
+    with pytest.raises(ValueError, match="not present in fresh authoritative topology"):
+        await server._resolve_sketch_plane_id(
+            {**BASE_IDS, "faceId": "face-missing"}
+        )
+
+    assert validate.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extrude_face_detection_uses_targeted_feature_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_features = AsyncMock(
+        return_value={
+            "features": [
+                {
+                    "featureId": "sketch-safe",
+                    "parameters": [
+                        {
+                            "parameterId": "sketchPlane",
+                            "queries": [{"deterministicIds": ["face-safe"]}],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(server.partstudio_manager, "get_features", get_features)
+
+    assert await server._sketch_is_on_face(
+        "doc-safe", "workspace-safe", "element-safe", "sketch-safe"
+    ) is True
+    get_features.assert_awaited_once_with(
+        "doc-safe",
+        "workspace-safe",
+        "element-safe",
+        feature_ids=["sketch-safe"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_successful_mutation_refreshes_context_and_invalidates_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContextStore()
+    record = store.create("doc-safe", "workspace-safe", "element-safe")
+    store.store_features(
+        record.working_state.context_handle,
+        {
+            "features": [
+                {
+                    "featureId": "feature-safe",
+                    "featureType": "extrude",
+                    "name": "Old",
+                    "parameters": [],
+                }
+            ],
+            "featureStates": {"feature-safe": {"featureStatus": "OK"}},
+        },
+    )
+    delegated_result = FeatureApplyResult(
+        ok=True,
+        status="OK",
+        feature_id="feature-safe",
+        feature_name="New",
+        feature_type="extrude",
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=True,
+        mutation_verification="verified",
+        changed=True,
+        verification_scope="feature_state",
+        raw={
+            "reread": {
+                "features": [
+                    {
+                        "featureId": "feature-safe",
+                        "featureType": "extrude",
+                        "name": "New",
+                        "parameters": [],
+                    },
+                    {
+                        "featureId": "server-neighbor",
+                        "featureType": "fillet",
+                        "name": "Neighbor",
+                        "parameters": [],
+                    },
+                ],
+                "featureStates": {
+                    "feature-safe": {"featureStatus": "OK"},
+                    "server-neighbor": {"featureStatus": "OK"},
+                },
+            }
+        },
+    )
+    delegated = AsyncMock(return_value=delegated_result)
+    invalidate = Mock(return_value=True)
+    monkeypatch.setattr(server, "context_store", store)
+    monkeypatch.setattr(server, "_apply_feature_and_check", delegated)
+    monkeypatch.setattr(server.entity_manager, "invalidate", invalidate)
+
+    result = await server.apply_feature_and_check(
+        server.client,
+        "doc-safe",
+        "workspace-safe",
+        "element-safe",
+        {"feature": {"featureType": "extrude"}},
+    )
+
+    cached = store.get(record.working_state.context_handle)
+    assert cached.raw_features["features"][0]["name"] == "New"
+    assert result.invalidation == {
+        "contexts_updated": 1,
+        "feature_ids": ["feature-safe"],
+        "feature_cache": "refreshed",
+        "topology_cache": "invalidated",
+        "topology_snapshot_evicted": True,
+    }
+    assert result.public_dict()["invalidation"] == result.invalidation
+    invalidate.assert_called_once_with("doc-safe", "workspace-safe", "element-safe")
+
+
+@pytest.mark.asyncio
+async def test_delete_mutation_replaces_context_and_invalidates_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContextStore()
+    record = store.create("doc-safe", "workspace-safe", "element-safe")
+    store.store_features(
+        record.working_state.context_handle,
+        {
+            "features": [
+                {
+                    "featureId": "delete-safe",
+                    "featureType": "extrude",
+                    "name": "Delete me",
+                    "parameters": [],
+                }
+            ],
+            "featureStates": {"delete-safe": {"featureStatus": "OK"}},
+        },
+    )
+    delegated = AsyncMock(
+        return_value=FeatureApplyResult(
+            ok=True,
+            status="OK",
+            feature_id="delete-safe",
+            feature_name="Delete me",
+            feature_type="extrude",
+            transport_ok=True,
+            http_ok=True,
+            regen_ok=True,
+            mutation_verification="verified",
+            changed=True,
+            verification_scope="feature_absence",
+            raw={"reread": {"features": [], "featureStates": {}}},
+        )
+    )
+    invalidate = Mock(return_value=True)
+    monkeypatch.setattr(server, "context_store", store)
+    monkeypatch.setattr(server, "_delete_partstudio_feature_and_check", delegated)
+    monkeypatch.setattr(server.entity_manager, "invalidate", invalidate)
+
+    result = await server.delete_partstudio_feature_and_check(
+        server.partstudio_manager,
+        "doc-safe",
+        "workspace-safe",
+        "element-safe",
+        "delete-safe",
+    )
+
+    cached = store.get(record.working_state.context_handle)
+    assert cached.raw_features["features"] == []
+    assert result.invalidation["feature_ids"] == ["delete-safe"]
+    invalidate.assert_called_once_with("doc-safe", "workspace-safe", "element-safe")
+
+
+@pytest.mark.asyncio
+async def test_document_hygiene_handler_excludes_bootstrap_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = DocumentHygieneTracker()
+    baseline = [
+        {"id": "part-default", "name": "Part Studio 1", "type": "PARTSTUDIO"},
+        {"id": "assembly-default", "name": "Assembly 1", "type": "ASSEMBLY"},
+        {"id": "bom-default", "name": "BOM", "type": "BOM"},
+    ]
+    tracker.capture_baseline("doc-safe", "workspace-safe", baseline)
+    monkeypatch.setattr(server, "hygiene_tracker", tracker)
+    monkeypatch.setattr(
+        server.document_manager, "get_elements", AsyncMock(return_value=baseline)
+    )
+
+    payload = _json_payload(
+        await server.call_tool(
+            "get_document_hygiene",
+            {"documentId": "doc-safe", "workspaceId": "workspace-safe"},
+        )
+    )
+
+    assert payload["status"] == "CLEAN"
+    assert payload["remaining_unexpected_jarvis_artifacts"] == []
+    assert [item["id"] for item in payload["baseline_elements"]] == [
+        "assembly-default",
+        "bom-default",
+        "part-default",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_variable_invalidates_workspace_part_studio_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContextStore()
+    record = store.create("doc-safe", "workspace-safe", "part-safe")
+    store.store_features(
+        record.working_state.context_handle,
+        {"features": [], "featureStates": {}},
+    )
+    invalidate_topology = Mock(return_value=1)
+    monkeypatch.setattr(server, "context_store", store)
+    monkeypatch.setattr(
+        server.entity_manager, "invalidate_workspace", invalidate_topology
+    )
+    monkeypatch.setattr(
+        server.variable_manager, "set_variable", AsyncMock(return_value={})
+    )
+
+    await server.call_tool(
+        "set_variable",
+        {
+            "documentId": "doc-safe",
+            "workspaceId": "workspace-safe",
+            "elementId": "variables-safe",
+            "name": "depth",
+            "expression": "12 mm",
+        },
+    )
+
+    assert store.get(record.working_state.context_handle).cache_metadata[
+        "state"
+    ] == "stale"
+    invalidate_topology.assert_called_once_with("doc-safe", "workspace-safe")
 
 
 @pytest.mark.asyncio

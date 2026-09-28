@@ -411,6 +411,39 @@ def test_live_policy(live_config):
     result.assert_outcomes(passed=1)
 
 
+def test_optimization_validation_has_isolated_ids_and_bounded_larger_budget(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_subprocess(pytester, monkeypatch)
+    monkeypatch.setenv("JARVIS_LIVE_TESTS", "1")
+    monkeypatch.setenv("JARVIS_LIVE_MUTATIONS", "1")
+    monkeypatch.setenv("JARVIS_LIVE_SUITE_BUDGET", "60")
+    monkeypatch.setenv("ONSHAPE_ACCESS_KEY", "access-canary")
+    monkeypatch.setenv("ONSHAPE_SECRET_KEY", "secret-canary")
+    pytester.makepyfile(
+        """
+import pytest
+
+@pytest.mark.live_onshape
+@pytest.mark.live_mutation
+@pytest.mark.live_optimization_validation
+@pytest.mark.live_budget(40)
+def test_live_policy(live_config, live_budget_guard):
+    assert live_config.document_id is None
+    assert live_config.workspace_id is None
+    assert live_config.element_id is None
+    assert live_budget_guard.test_limit == 40
+    assert live_budget_guard.suite_budget.limit == 60
+"""
+    )
+
+    result = pytester.runpytest_subprocess(
+        "-q", "-m", "live_onshape and live_optimization_validation"
+    )
+
+    result.assert_outcomes(passed=1)
+
+
 @pytest.mark.parametrize(
     "markers",
     [

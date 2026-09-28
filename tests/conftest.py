@@ -24,6 +24,7 @@ def pytest_configure(config):
         "live_readonly: read-only live test",
         "live_mutation: mutating live test",
         "live_create_document: create-only live mutation canary",
+        "live_optimization_validation: isolated disposable optimization validation",
         "live_budget(limit): lower a live test physical-send budget",
     ):
         config.addinivalue_line("markers", marker)
@@ -129,15 +130,21 @@ def pytest_collection_modifyitems(config, items):
         readonly = item.get_closest_marker("live_readonly") is not None
         mutation = item.get_closest_marker("live_mutation") is not None
         create_document = item.get_closest_marker("live_create_document") is not None
+        optimization_validation = (
+            item.get_closest_marker("live_optimization_validation") is not None
+        )
         budget = item.get_closest_marker("live_budget")
         if live != (readonly or mutation) or (readonly and mutation) or (budget and not live):
             _fail("LIVE_MARKERS_INVALID")
         if create_document and not (live and mutation and not readonly):
             _fail("LIVE_MARKERS_INVALID")
+        if optimization_validation and not (live and mutation and not readonly):
+            _fail("LIVE_MARKERS_INVALID")
         if budget:
             if len(budget.args) != 1 or not isinstance(budget.args[0], int) or budget.args[0] <= 0:
                 _fail("LIVE_BUDGET_INVALID")
-            if budget.args[0] > (8 if mutation else 3):
+            ceiling = 60 if optimization_validation else 8 if mutation else 3
+            if budget.args[0] > ceiling:
                 _fail("LIVE_BUDGET_INVALID")
     if not live_items:
         return
@@ -151,13 +158,14 @@ def pytest_collection_modifyitems(config, items):
         _fail("LIVE_POSITIVE_SELECTION_REQUIRED")
     if os.getenv("PYTEST_XDIST_WORKER") or getattr(config.option, "numprocesses", 0):
         _fail("LIVE_PARALLEL_FORBIDDEN")
-    create_only = bool(live_items) and all(
+    isolated_document = bool(live_items) and all(
         item.get_closest_marker("live_create_document") is not None
+        or item.get_closest_marker("live_optimization_validation") is not None
         for item in live_items
     )
-    config._jarvis_live_requires_model_ids = not create_only
+    config._jarvis_live_requires_model_ids = not isolated_document
     try:
-        load_live_config(require_model_ids=not create_only)
+        load_live_config(require_model_ids=not isolated_document)
     except LiveConfigurationError as error:
         _fail(str(error))
     config._jarvis_live_session_report = True
@@ -183,15 +191,19 @@ def live_suite_budget(live_config):
 @pytest.fixture
 def live_budget_guard(request, live_suite_budget, live_session_telemetry):
     mutation = request.node.get_closest_marker("live_mutation") is not None
-    limit = 8 if mutation else 3
+    optimization_validation = (
+        request.node.get_closest_marker("live_optimization_validation") is not None
+    )
+    limit = 60 if optimization_validation else 8 if mutation else 3
     marker = request.node.get_closest_marker("live_budget")
     if marker:
         limit = marker.args[0]
-    scenario_id = (
-        "LIVE-DEEP-READ-01"
-        if request.node.name == "test_live_deep_read_01"
-        else "LIVE-SCENARIO"
-    )
+    if optimization_validation:
+        scenario_id = "LIVE-OPTIMIZATION-VALIDATION"
+    elif request.node.name == "test_live_deep_read_01":
+        scenario_id = "LIVE-DEEP-READ-01"
+    else:
+        scenario_id = "LIVE-SCENARIO"
     return LiveBudgetGuard(
         scenario_id,
         limit,

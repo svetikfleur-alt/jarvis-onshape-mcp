@@ -1,6 +1,7 @@
 """Onshape API client for REST API communication."""
 
 import base64
+import json
 import os
 import re
 from typing import Any, Dict, Mapping, Optional
@@ -167,7 +168,11 @@ class OnshapeClient:
     """
 
     def __init__(
-        self, credentials: OnshapeCredentials, *, transport: Optional[httpx.AsyncBaseTransport] = None
+        self,
+        credentials: OnshapeCredentials,
+        *,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+        metrics: Optional[Any] = None,
     ):
         """Initialize the Onshape client.
 
@@ -177,6 +182,7 @@ class OnshapeClient:
         self.credentials = credentials
         self.base_url = credentials.base_url
         self._transport = transport
+        self.metrics = metrics
         self._client: Optional[httpx.AsyncClient] = None
         self._own_client = False
 
@@ -282,7 +288,16 @@ class OnshapeClient:
         self._ensure_client()
         route = redact_onshape_route(path)
         logger.debug("GET {} params={}", route, self._sanitize_for_logging(params))
-        response = await self._client.get(url, params=params, headers=headers)
+        if self.metrics is not None:
+            self.metrics.record_http_attempt("GET", path, params=params)
+        try:
+            response = await self._client.get(url, params=params, headers=headers)
+        except Exception:
+            if self.metrics is not None:
+                self.metrics.record_http_failure()
+            raise
+        if self.metrics is not None:
+            self.metrics.record_http_completion(response_bytes=len(response.content))
         self._raise_for_status(response, method="GET", path=path)
         result = response.json()
         logger.debug("GET {} response={}", route, self._sanitize_for_logging(result))
@@ -316,9 +331,18 @@ class OnshapeClient:
         self._ensure_client()
         route = redact_onshape_route(path)
         logger.debug("GET(raw) {} params={}", route, self._sanitize_for_logging(params))
-        response = await self._client.get(
-            url, params=params, headers=headers, follow_redirects=follow_redirects
-        )
+        if self.metrics is not None:
+            self.metrics.record_http_attempt("GET", path, params=params)
+        try:
+            response = await self._client.get(
+                url, params=params, headers=headers, follow_redirects=follow_redirects
+            )
+        except Exception:
+            if self.metrics is not None:
+                self.metrics.record_http_failure()
+            raise
+        if self.metrics is not None:
+            self.metrics.record_http_completion(response_bytes=len(response.content))
         self._raise_for_status(response, method="GET", path=path)
         logger.debug("GET(raw) {} returned {} bytes", route, len(response.content))
         return response.content
@@ -350,7 +374,29 @@ class OnshapeClient:
         route = redact_onshape_route(path)
         logger.debug("POST {} params={}", route, self._sanitize_for_logging(params))
         logger.debug("POST {} body={}", route, self._sanitize_for_logging(data))
-        response = await self._client.post(url, json=data, params=params, headers=headers)
+        request_bytes = (
+            len(
+                json.dumps(
+                    data, ensure_ascii=False, separators=(",", ":"), default=str
+                ).encode("utf-8")
+            )
+            if data is not None
+            else 0
+        )
+        if self.metrics is not None:
+            self.metrics.record_http_attempt(
+                "POST", path, params=params, request_bytes=request_bytes
+            )
+        try:
+            response = await self._client.post(
+                url, json=data, params=params, headers=headers
+            )
+        except Exception:
+            if self.metrics is not None:
+                self.metrics.record_http_failure()
+            raise
+        if self.metrics is not None:
+            self.metrics.record_http_completion(response_bytes=len(response.content))
         self._raise_for_status(response, method="POST", path=path)
         if not response.content:
             logger.debug("POST {} returned empty body status={}", route, response.status_code)
@@ -376,7 +422,16 @@ class OnshapeClient:
         }
 
         self._ensure_client()
-        response = await self._client.delete(url, params=params, headers=headers)
+        if self.metrics is not None:
+            self.metrics.record_http_attempt("DELETE", path, params=params)
+        try:
+            response = await self._client.delete(url, params=params, headers=headers)
+        except Exception:
+            if self.metrics is not None:
+                self.metrics.record_http_failure()
+            raise
+        if self.metrics is not None:
+            self.metrics.record_http_completion(response_bytes=len(response.content))
         self._raise_for_status(response, method="DELETE", path=path)
         if not response.content:
             return {}

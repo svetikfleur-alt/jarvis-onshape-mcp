@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Optional
 import httpx
 from mcp.server import Server
@@ -36,10 +37,10 @@ from .api.assemblies import AssemblyManager
 from .api.featurescript import FeatureScriptManager
 from .api.export import ExportManager
 from .api.feature_apply import (
-    apply_feature_and_check,
+    apply_feature_and_check as _apply_feature_and_check,
     apply_assembly_feature_and_check,
-    delete_partstudio_feature_and_check,
-    update_feature_params_and_check,
+    delete_partstudio_feature_and_check as _delete_partstudio_feature_and_check,
+    update_feature_params_and_check as _update_feature_params_and_check,
     FeatureApplyResult,
     MutationPreflightError,
 )
@@ -77,6 +78,8 @@ from .governance import (
     BudgetState,
     ContextNotFoundError,
     ContextStore,
+    DocumentHygieneTracker,
+    ExecutionMetrics,
     FeatureNotFoundError,
     GovernanceBudgetError,
     MAX_DEPENDENCY_ROWS,
@@ -107,9 +110,10 @@ logger.add(
 # turns aren't spent guessing tool names.
 _INSTRUCTIONS = """\
 Jarvis Onshape MCP — drive real CAD. Tools are lazy-loaded (fetch schemas via
-ToolSearch before calling). Use `describe_part_studio` as your verification
-loop after every mutation — it returns topology + multi-view renders in one
-call.
+ToolSearch before calling). A mutation with `mutation_verification="verified"`
+already includes an authoritative requested-state reread. Use
+`describe_part_studio` at visual/engineering checkpoints, not solely to repeat
+that verification.
 
 ## Tool index
 
@@ -118,6 +122,7 @@ call.
 - get_document_summary / get_document — structure and metadata
 - list_documents / search_documents — find existing
 - get_elements / find_part_studios / get_parts — enumerate within a workspace
+- get_document_hygiene — baseline-aware CLEAN / NOT CLEAN element provenance
 - create_part_studio / create_assembly — new elements inside a doc
 - delete_document / delete_feature / delete_feature_by_name — cleanup
 
@@ -148,9 +153,10 @@ list_entities, or from create_offset_plane).
 
 ### Introspection (USE OFTEN)
 - get_runtime_info — non-secret package/source/Python/credential-presence diagnostic; never calls Onshape
+- get_execution_metrics — bounded HTTP/cache/MCP round-trip and response-size counters
 - start_model_context / get_feature_tree_compact / find_features / inspect_feature — bounded cached feature intelligence
 - inspect_feature_dependencies / get_dependency_slice / update_working_state / get_context_status — local dependency navigation and working state
-- describe_part_studio — topology + multi-view renders in one call. First stop after every mutation.
+- describe_part_studio — topology + multi-view renders for visual checkpoints and engineering decisions.
 - list_entities — faces/edges/vertices with filters: outward_axis, at_z_mm, geometryType, radius_range_mm, length_range_mm
 - get_features / get_body_details — feature tree with statuses, per-part face/edge IDs
 - get_mass_properties / get_bounding_box / measure
@@ -198,7 +204,8 @@ app = Server("onshape-mcp", instructions=_INSTRUCTIONS)
 # Initialize without making imports or schema/listing operations depend on
 # credentials. The client rejects a missing/empty pair at the request boundary.
 credentials = resolve_onshape_credentials()
-client = OnshapeClient(credentials)
+execution_metrics = ExecutionMetrics()
+client = OnshapeClient(credentials, metrics=execution_metrics)
 partstudio_manager = PartStudioManager(client)
 variable_manager = VariableManager(client)
 document_manager = DocumentManager(client)
@@ -206,11 +213,135 @@ assembly_manager = AssemblyManager(client)
 featurescript_manager = FeatureScriptManager(client)
 export_manager = ExportManager(client)
 shaded_view_manager = ShadedViewManager(client)
-entity_manager = EntityManager(client)
+entity_manager = EntityManager(client, metrics=execution_metrics)
 measurement_manager = MeasurementManager(client)
 describe_manager = DescribeManager(client)
 custom_feature_manager = CustomFeatureManager(client)
-context_store = ContextStore()
+context_store = ContextStore(metrics=execution_metrics)
+hygiene_tracker = DocumentHygieneTracker()
+
+
+def _sync_partstudio_mutation_state(
+    result: FeatureApplyResult,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    *,
+    created: bool = False,
+) -> None:
+    """Reconcile feature caches and invalidate topology after a mutation attempt."""
+
+    reread = result.raw.get("reread")
+    if isinstance(reread, dict):
+        invalidation = context_store.apply_authoritative_feature_delta(
+            document_id,
+            workspace_id,
+            element_id,
+            reread,
+            created_feature_ids=[result.feature_id]
+            if created and result.feature_id
+            else None,
+        )
+    else:
+        invalidation = context_store.invalidate_model(
+            document_id,
+            workspace_id,
+            element_id,
+            feature_ids=[result.feature_id] if result.feature_id else [],
+        )
+    if result.feature_id:
+        invalidation["feature_ids"] = [result.feature_id]
+    invalidation["topology_snapshot_evicted"] = entity_manager.invalidate(
+        document_id, workspace_id, element_id
+    )
+    result.invalidation = invalidation
+
+
+async def apply_feature_and_check(
+    client: OnshapeClient,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    feature_payload: dict[str, Any],
+    **kwargs: Any,
+) -> FeatureApplyResult:
+    result = await _apply_feature_and_check(
+        client,
+        document_id,
+        workspace_id,
+        element_id,
+        feature_payload,
+        **kwargs,
+    )
+    _sync_partstudio_mutation_state(
+        result,
+        document_id,
+        workspace_id,
+        element_id,
+        created=kwargs.get("operation", "create") == "create",
+    )
+    return result
+
+
+async def update_feature_params_and_check(
+    client: OnshapeClient,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    feature_id: str,
+    updates: list[dict[str, Any]],
+) -> FeatureApplyResult:
+    result = await _update_feature_params_and_check(
+        client,
+        document_id,
+        workspace_id,
+        element_id,
+        feature_id,
+        updates,
+    )
+    _sync_partstudio_mutation_state(
+        result, document_id, workspace_id, element_id
+    )
+    return result
+
+
+async def delete_partstudio_feature_and_check(
+    manager: PartStudioManager,
+    document_id: str,
+    workspace_id: str,
+    element_id: str,
+    feature_id: str,
+    **kwargs: Any,
+) -> FeatureApplyResult:
+    result = await _delete_partstudio_feature_and_check(
+        manager,
+        document_id,
+        workspace_id,
+        element_id,
+        feature_id,
+        **kwargs,
+    )
+    reread = result.raw.get("reread")
+    if isinstance(reread, dict):
+        invalidation = context_store.replace_authoritative_snapshot(
+            document_id,
+            workspace_id,
+            element_id,
+            reread,
+            affected_feature_ids=[feature_id],
+        )
+    else:
+        invalidation = context_store.invalidate_model(
+            document_id,
+            workspace_id,
+            element_id,
+            feature_ids=[feature_id],
+        )
+    invalidation["topology_snapshot_evicted"] = entity_manager.invalidate(
+        document_id, workspace_id, element_id
+    )
+    result.invalidation = invalidation
+    return result
 
 
 def _governance_content(envelope: ObservationEnvelope, record: Any) -> list[TextContent]:
@@ -1007,6 +1138,34 @@ async def list_tools() -> list[Tool]:
                             "Optional filter by element type " "(e.g., 'PARTSTUDIO', 'ASSEMBLY')"
                         ),
                     },
+                },
+                "required": ["documentId", "workspaceId"],
+            },
+        ),
+        Tool(
+            name="get_execution_metrics",
+            description=(
+                "Return bounded process-local HTTP, cache, MCP invocation, round-trip, "
+                "elapsed-time, and response-size counters. No request values or raw "
+                "Onshape payloads are retained."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="get_document_hygiene",
+            description=(
+                "Compare current workspace elements with the bootstrap baseline and "
+                "Jarvis-tracked additions without deleting anything."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documentId": {"type": "string", "description": "Document ID"},
+                    "workspaceId": {"type": "string", "description": "Workspace ID"},
                 },
                 "required": ["documentId", "workspaceId"],
             },
@@ -2896,7 +3055,8 @@ def _hints_for_result(result: FeatureApplyResult) -> list[str]:
     status-based hints follow.
 
     Rotation policy:
-      - OK / INFO   -> next-step reflex: describe + mention write_featurescript_feature.
+      - verified    -> continue unless the next decision needs topology/render evidence.
+      - failed      -> resolve requested-state mismatch or regeneration failure.
       - WARNING     -> read error_message, check VS for missing vars.
       - ERROR       -> update_feature or delete_feature_by_name + retry.
       - EXCEPTION   -> handled in `_exception_json`, not here.
@@ -2910,13 +3070,22 @@ def _hints_for_result(result: FeatureApplyResult) -> list[str]:
         return [
             "The requested mutation had no detectable effect. Check feature and parameter IDs before retrying."
         ]
+    if result.mutation_verification == "failed" and result.regen_ok is not False:
+        return [
+            "The feature regenerated, but the authoritative requested state mismatch "
+            "must be resolved before continuing. Inspect the reported feature fields "
+            "or correct the mutation parameters."
+        ]
     status = result.status
     enum_hints = _enum_specific_hints(result.error_message)
 
     if status in ("OK", "INFO"):
         generic = [
-            "To see what changed, call describe_part_studio — the PHYSICAL "
-            "SUMMARY + changes block show new topology at a glance.",
+            "The requested feature state is already authoritatively verified. "
+            "Continue directly unless the next engineering decision needs fresh "
+            "topology, dimensions, or a render.",
+            "If the next feature needs a face, edge, or body target, call filtered "
+            "list_entities; mutation invalidation makes its next snapshot fresh.",
             "Doing the same 3-feature pattern twice? write_featurescript_feature "
             "can encapsulate it as a reusable op. See SKILL.md -> When to write "
             "a FeatureScript custom feature.",
@@ -2947,6 +3116,38 @@ def _hints_for_result(result: FeatureApplyResult) -> list[str]:
         ]
 
     return enum_hints + generic
+
+
+_CHANGE_LIST_FIELDS = (
+    "faces_added",
+    "faces_removed",
+    "edges_added",
+    "edges_removed",
+)
+_CHANGE_SAMPLE_LIMIT = 8
+
+
+def _compact_changes(changes: dict[str, Any]) -> dict[str, Any]:
+    """Keep CAD delta evidence bounded while retaining exact internal data."""
+
+    compact = {
+        key: value for key, value in changes.items() if key not in _CHANGE_LIST_FIELDS
+    }
+    truncated = False
+    for field_name in _CHANGE_LIST_FIELDS:
+        items = changes.get(field_name)
+        if not isinstance(items, list):
+            continue
+        compact[f"{field_name}_count"] = len(items)
+        if len(items) <= _CHANGE_SAMPLE_LIMIT:
+            compact[field_name] = list(items)
+            continue
+        sample = list(items[:_CHANGE_SAMPLE_LIMIT])
+        compact[f"{field_name}_sample"] = sample
+        compact[f"{field_name}_truncated"] = True
+        truncated = True
+    compact["truncated"] = truncated
+    return compact
 
 
 def _feature_apply_json(
@@ -2986,7 +3187,7 @@ def _feature_apply_json(
         # "git diff" for CAD — only present when the handler asked the
         # helper to track_changes. Topology-mutating tools default it on;
         # sketches default it off (sketches don't change body topology).
-        payload["changes"] = result.changes
+        payload["changes"] = _compact_changes(result.changes)
     # Default status-based hints if the handler didn't override.
     hints_list = list(hints) if hints else _hints_for_result(result)
     if hints_list:
@@ -3033,7 +3234,10 @@ async def _sketch_is_on_face(
     """
     try:
         feats = await partstudio_manager.get_features(
-            document_id, workspace_id, element_id
+            document_id,
+            workspace_id,
+            element_id,
+            feature_ids=[sketch_feature_id],
         )
         sketch = next(
             (
@@ -3074,6 +3278,26 @@ async def _resolve_sketch_plane_id(
         if arguments.get("plane"):
             warnings.append(
                 "Both `plane` and `faceId` provided; using `faceId`."
+            )
+        validation = await entity_manager.validate_entity_ids(
+            arguments["documentId"],
+            arguments["workspaceId"],
+            arguments["elementId"],
+            kind="faces",
+            entity_ids=[face_id],
+        )
+        context_store.mark_topology_fresh(
+            arguments["documentId"],
+            arguments["workspaceId"],
+            arguments["elementId"],
+        )
+        if validation["refreshed"]:
+            warnings.append(
+                "Topology evidence was refreshed before accepting `faceId`."
+            )
+        if not validation["valid"]:
+            raise ValueError(
+                f"faceId {face_id!r} is not present in fresh authoritative topology"
             )
         return face_id, SketchPlane.FRONT, warnings
     plane_name = arguments.get("plane", "Front")
@@ -3397,8 +3621,7 @@ async def _create_mate(
     )
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
+async def _call_tool_impl(name: str, arguments: Any) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
     if name == "get_runtime_info":
@@ -3406,6 +3629,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             TextContent(
                 type="text",
                 text=json.dumps(get_runtime_info(), indent=2, sort_keys=True),
+            )
+        ]
+
+    elif name == "get_execution_metrics":
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(execution_metrics.snapshot(), indent=2, sort_keys=True),
             )
         ]
 
@@ -3643,6 +3874,16 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 arguments["workspaceId"],
                 arguments["name"],
             )
+            hygiene_tracker.register_addition(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                {
+                    "id": vs_eid,
+                    "name": arguments["name"],
+                    "type": "VARIABLESTUDIO",
+                },
+                classification="intentional",
+            )
             return [
                 TextContent(
                     type="text",
@@ -3681,6 +3922,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 arguments.get("description"),
                 arguments.get("type", "LENGTH"),
             )
+            invalidated_contexts = context_store.invalidate_workspace(
+                arguments["documentId"], arguments["workspaceId"]
+            )
+            invalidated_topology = entity_manager.invalidate_workspace(
+                arguments["documentId"], arguments["workspaceId"]
+            )
 
             return [
                 TextContent(
@@ -3688,7 +3935,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                     text=(
                         f"Set variable '{arguments['name']}' = {arguments['expression']} "
                         f"({arguments.get('type', 'LENGTH')}) in Variable Studio "
-                        f"{arguments['elementId']}"
+                        f"{arguments['elementId']}\n"
+                        f"Invalidated {invalidated_contexts} feature context(s) and "
+                        f"{invalidated_topology} topology snapshot(s) in this workspace."
                     ),
                 )
             ]
@@ -4647,6 +4896,29 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
             ]
 
+    elif name == "get_document_hygiene":
+        try:
+            elements = await document_manager.get_elements(
+                arguments["documentId"], arguments["workspaceId"]
+            )
+            payload = hygiene_tracker.evaluate(
+                arguments["documentId"], arguments["workspaceId"], elements
+            )
+            payload["tool"] = name
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+        except httpx.HTTPStatusError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=_exception_json(
+                        e, tool_name=name, status_code=e.response.status_code
+                    ),
+                )
+            ]
+        except Exception as e:
+            _log_unexpected_error("Unexpected error evaluating document hygiene", e)
+            return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
+
     elif name == "get_assembly":
         try:
             assembly_data = await assembly_manager.get_assembly_definition(
@@ -4859,7 +5131,14 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 )
                 if main_ws:
                     workspace_id = main_ws.id
-                    studios = await document_manager.find_part_studios(doc.id, main_ws.id)
+                    elements = await document_manager.get_elements(doc.id, main_ws.id)
+                    hygiene_tracker.capture_baseline(doc.id, main_ws.id, elements)
+                    studios = [
+                        element
+                        for element in elements
+                        if element.element_type.replace(" ", "").upper()
+                        == "PARTSTUDIO"
+                    ]
                     if studios:
                         part_studio_id = studios[0].id
                         part_studio_name = studios[0].name
@@ -4956,6 +5235,17 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 name=arguments["name"],
             )
             element_id = result.get("id", "unknown")
+            if element_id != "unknown":
+                hygiene_tracker.register_addition(
+                    arguments["documentId"],
+                    arguments["workspaceId"],
+                    {
+                        "id": element_id,
+                        "name": arguments["name"],
+                        "type": "PARTSTUDIO",
+                    },
+                    classification="intentional",
+                )
 
             # Enumerate every PartStudio now in the workspace and report
             # those OTHER than the one we just created. Most new Onshape
@@ -5020,6 +5310,17 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 name=arguments["name"],
             )
             element_id = result.get("id", "")
+            if element_id:
+                hygiene_tracker.register_addition(
+                    arguments["documentId"],
+                    arguments["workspaceId"],
+                    {
+                        "id": element_id,
+                        "name": arguments["name"],
+                        "type": "ASSEMBLY",
+                    },
+                    classification="intentional",
+                )
             payload = {
                 "ok": bool(element_id),
                 "status": "OK" if element_id else "UNKNOWN",
@@ -5415,6 +5716,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 remove_ids=arguments.get("removeIds") or [],
             )
             apply = result.apply
+            _sync_partstudio_mutation_state(
+                apply,
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+            )
             payload = apply.public_dict()
             payload.update({
                 "added_entity_ids": result.added_entity_ids,
@@ -6491,6 +6798,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 radius_range_mm=arguments.get("radiusRangeMm"),
                 length_range_mm=arguments.get("lengthRangeMm"),
             )
+            context_store.mark_topology_fresh(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+            )
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
         except ValueError as e:
             return [TextContent(type="text", text=_exception_json(e, tool_name=name))]
@@ -6598,6 +6910,24 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
                 fs_element_name=arguments.get("fsElementName"),
             )
             apply = out["apply_result"]
+            _sync_partstudio_mutation_state(
+                apply,
+                arguments["documentId"],
+                arguments["workspaceId"],
+                arguments["elementId"],
+                created=True,
+            )
+            hygiene_tracker.register_addition(
+                arguments["documentId"],
+                arguments["workspaceId"],
+                {
+                    "id": out["fs_element_id"],
+                    "name": arguments.get("fsElementName")
+                    or f"ClaudeFS_{arguments['featureType']}",
+                    "type": "FEATURESTUDIO",
+                },
+                classification="intentional" if apply.ok else "temporary",
+            )
             payload = apply.public_dict()
             payload.update({
                 "fs_element_id": out["fs_element_id"],
@@ -6615,6 +6945,43 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
 
     else:
         raise ValueError(f"Unknown tool: {name}")
+
+
+def _content_size_bytes(items: list[TextContent | ImageContent]) -> int:
+    total = 0
+    for item in items:
+        text_value = getattr(item, "text", None)
+        if isinstance(text_value, str):
+            total += len(text_value.encode("utf-8"))
+        data_value = getattr(item, "data", None)
+        if isinstance(data_value, bytes):
+            total += len(data_value)
+        elif isinstance(data_value, str):
+            total += len(data_value.encode("utf-8"))
+    return total
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
+    """Measure one observable model → tool → model boundary."""
+
+    started = perf_counter()
+    try:
+        result = await _call_tool_impl(name, arguments)
+    except Exception:
+        execution_metrics.record_tool(
+            name,
+            response_bytes=0,
+            elapsed_ms=(perf_counter() - started) * 1000.0,
+            failed=True,
+        )
+        raise
+    execution_metrics.record_tool(
+        name,
+        response_bytes=_content_size_bytes(result),
+        elapsed_ms=(perf_counter() - started) * 1000.0,
+    )
+    return result
 
 
 async def main_stdio():

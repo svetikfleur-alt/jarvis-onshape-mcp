@@ -1,6 +1,6 @@
 """Part Studio management for Onshape."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 from .client import OnshapeClient
 
@@ -18,7 +18,12 @@ class PartStudioManager:
         self._plane_id_cache: Dict[str, str] = {}
 
     async def get_features(
-        self, document_id: str, workspace_id: str, element_id: str
+        self,
+        document_id: str,
+        workspace_id: str,
+        element_id: str,
+        *,
+        feature_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Get all features from a Part Studio.
 
@@ -31,7 +36,8 @@ class PartStudioManager:
             Features data
         """
         path = f"/api/v9/partstudios/d/{document_id}/w/{workspace_id}/e/{element_id}/features"
-        return await self.client.get(path)
+        params = {"featureId": list(feature_ids)} if feature_ids else None
+        return await self.client.get(path, params=params)
 
     async def add_feature(
         self, document_id: str, workspace_id: str, element_id: str, feature_data: Dict[str, Any]

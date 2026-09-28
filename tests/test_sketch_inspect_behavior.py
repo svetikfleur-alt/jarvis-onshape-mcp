@@ -236,6 +236,20 @@ def test_inspect_sketch_summarizes_supported_geometry_and_constraints() -> None:
     assert "(True)" in constraints["c-boolean-direction"]["summary"]
     assert "ENTITIES (6):" in result["text"]
     assert "CONSTRAINTS (11):" in result["text"]
+    assert result["constraint_quality"] == {
+        "authoritative_status_available": False,
+        "fully_constrained": None,
+        "degrees_of_freedom": None,
+        "entity_count": 6,
+        "constraint_count": 11,
+        "production_complete": None,
+        "quality_state": "UNVERIFIED",
+        "reason": (
+            "The authoritative feature response does not expose sketch degrees "
+            "of freedom or fully-constrained status."
+        ),
+    }
+    assert "CONSTRAINT QUALITY: UNVERIFIED" in result["text"]
 
 
 def test_inspect_empty_sketch_reports_unknown_state_and_empty_sections() -> None:
@@ -262,6 +276,7 @@ def test_inspect_empty_sketch_reports_unknown_state_and_empty_sections() -> None
     assert result["plane_query"] == []
     assert "ENTITIES: none" in result["text"]
     assert "CONSTRAINTS: none" in result["text"]
+    assert result["constraint_quality"]["quality_state"] == "UNVERIFIED"
 
 
 def test_find_sketch_resolves_by_id_or_exact_name() -> None:

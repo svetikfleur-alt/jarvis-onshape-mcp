@@ -72,6 +72,7 @@ markers = [
     "live_readonly: marks read-only live Onshape tests",
     "live_mutation: marks mutating live Onshape tests",
     "live_create_document: marks the create-only live mutation canary",
+    "live_optimization_validation: marks the isolated disposable V6 optimization validation",
     "live_budget(limit): lowers the physical-send budget for a live test",
     "slow: marks tests as slow running",
 ]

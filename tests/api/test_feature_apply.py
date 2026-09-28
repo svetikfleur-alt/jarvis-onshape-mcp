@@ -429,7 +429,211 @@ class TestPartStudioMutationTruth:
         assert result.mutation_verification == "verified"
         assert result.changed is True
         assert result.verification_scope == "feature_state"
-        onshape_client.get.assert_awaited_once()
+        onshape_client.get.assert_awaited_once_with(
+            "/api/v9/partstudios/d/d/w/w/e/e/features",
+            params={"featureId": ["created"]},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("feature_type", "requested_parameters", "authoritative_parameters"),
+        [
+            (
+                "extrude",
+                [
+                    {
+                        "btType": "BTMParameterQuantity-147",
+                        "parameterId": "depth",
+                        "parameterName": "",
+                        "expression": "10 mm",
+                        "value": 0.01,
+                        "units": "",
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterQuantity-147",
+                        "parameterId": "depth",
+                        "expression": "0.01 m",
+                        "value": 0.01,
+                        "units": "meter",
+                        "nodeId": "server-node",
+                    }
+                ],
+            ),
+            (
+                "linearPattern",
+                [
+                    {
+                        "btType": "BTMParameterFeatureList-1749",
+                        "parameterId": "instanceFunction",
+                        "featureIds": ["feature-b", "feature-a"],
+                        "parameterName": "",
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterFeatureList-1749",
+                        "parameterId": "instanceFunction",
+                        "featureIds": ["feature-a", "feature-b"],
+                    }
+                ],
+            ),
+            (
+                "shell",
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "entities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["face-b", "face-a"],
+                            }
+                        ],
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "entities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["face-a", "face-b"],
+                                "queryString": "server canonical query",
+                            }
+                        ],
+                    }
+                ],
+            ),
+            (
+                "chamfer",
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "entities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["edge-b", "edge-a"],
+                            }
+                        ],
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "entities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["edge-a", "edge-b"],
+                            }
+                        ],
+                    }
+                ],
+            ),
+            (
+                "draft",
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "draftEntities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["face-b", "face-a"],
+                            }
+                        ],
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "draftEntities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["face-a", "face-b"],
+                            }
+                        ],
+                    }
+                ],
+            ),
+            (
+                "transform",
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "bodies",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["body-b", "body-a"],
+                            }
+                        ],
+                    }
+                ],
+                [
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "bodies",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["body-a", "body-b"],
+                            }
+                        ],
+                    }
+                ],
+            ),
+        ],
+    )
+    async def test_common_capability_canonical_state_verifies_without_agent_followup(
+        self,
+        onshape_client,
+        feature_type,
+        requested_parameters,
+        authoritative_parameters,
+    ):
+        requested = {
+            "btType": "BTMFeature-134",
+            "featureType": feature_type,
+            "name": "Requested feature",
+            "suppressed": False,
+            "namespace": "",
+            "parameters": requested_parameters,
+        }
+        actual = {
+            "btType": "BTMFeature-999",
+            "featureId": "created",
+            "featureType": feature_type,
+            "name": "Requested feature",
+            "suppressed": False,
+            "parameters": authoritative_parameters,
+            "nodeId": "server-feature-node",
+        }
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": actual,
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+        onshape_client.get = AsyncMock(
+            return_value={
+                "features": [actual],
+                "featureStates": {"created": {"featureStatus": "OK"}},
+            }
+        )
+
+        result = await apply_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": requested}
+        )
+
+        assert result.ok is True
+        assert result.mutation_verification == "verified"
+        assert result.reason_code == "REQUESTED_STATE_VERIFIED"
 
     @pytest.mark.asyncio
     async def test_create_with_failed_reread_is_honestly_unverified(
@@ -746,6 +950,239 @@ class TestPartStudioMutationTruth:
         assert result.changed is True
         assert result.verification_scope == "requested_parameters"
         assert onshape_client.get.await_count == 2
+        assert onshape_client.get.await_args_list[0].kwargs == {
+            "params": {"featureId": ["fId"]}
+        }
+        assert onshape_client.get.await_args_list[1].kwargs == {
+            "params": {"featureId": ["fId"]}
+        }
+
+    @pytest.mark.asyncio
+    async def test_update_canonical_quantity_value_verifies_new_state(
+        self, onshape_client
+    ):
+        before = _extrude_feature(depth_expr="10 mm", depth_value=0.01)
+        after = _extrude_feature(depth_expr="0.015 m", depth_value=0.015)
+        onshape_client.get = AsyncMock(
+            side_effect=[
+                {"features": [before]},
+                {
+                    "features": [after],
+                    "featureStates": {"fId": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {"featureId": "fId", "featureType": "extrude"},
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+
+        result = await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "fId",
+            [{"parameterId": "depth", "expression": "15 mm"}],
+        )
+
+        assert result.ok is True
+        assert result.mutation_verification == "verified"
+        assert result.reason_code == "REQUESTED_STATE_VERIFIED"
+
+    @pytest.mark.asyncio
+    async def test_update_canonical_quantity_old_value_does_not_verify(
+        self, onshape_client
+    ):
+        before = _extrude_feature(depth_expr="10 mm", depth_value=0.01)
+        after = _extrude_feature(depth_expr="0.01 m", depth_value=0.01)
+        onshape_client.get = AsyncMock(
+            side_effect=[
+                {"features": [before]},
+                {
+                    "features": [after],
+                    "featureStates": {"fId": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {"featureId": "fId", "featureType": "extrude"},
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+
+        result = await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "fId",
+            [{"parameterId": "depth", "expression": "15 mm"}],
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "no_effect"
+        assert result.reason_code == "REQUESTED_STATE_UNCHANGED"
+
+    @pytest.mark.asyncio
+    async def test_update_checks_fields_after_canonical_expression_match(
+        self, onshape_client
+    ):
+        before = _extrude_feature(depth_expr="10 mm", depth_value=0.01)
+        after = _extrude_feature(depth_expr="0.015 m", depth_value=0.015)
+        onshape_client.get = AsyncMock(
+            side_effect=[
+                {"features": [before]},
+                {
+                    "features": [after],
+                    "featureStates": {"fId": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {"featureId": "fId", "featureType": "extrude"},
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+
+        result = await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "fId",
+            [
+                {
+                    "parameterId": "depth",
+                    "expression": "15 mm",
+                    "value": 0.02,
+                }
+            ],
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "failed"
+        assert result.reason_code == "REQUESTED_STATE_MISMATCH"
+
+    @pytest.mark.asyncio
+    async def test_empty_deterministic_ids_do_not_prove_query_text_equivalence(
+        self, onshape_client
+    ):
+        requested = {
+            "featureType": "revolve",
+            "name": "Revolve",
+            "parameters": [
+                {
+                    "btType": "BTMParameterQueryList-148",
+                    "parameterId": "axis",
+                    "queries": [
+                        {
+                            "btType": "BTMIndividualQuery-138",
+                            "deterministicIds": [],
+                            "queryString": "qCreatedBy(makeId('Top'), EntityType.EDGE)",
+                        }
+                    ],
+                }
+            ],
+        }
+        actual = copy.deepcopy(requested)
+        actual["featureId"] = "created"
+        actual["parameters"][0]["queries"][0]["queryString"] = (
+            "qCreatedBy(makeId('Right'), EntityType.EDGE)"
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": actual,
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+        onshape_client.get = AsyncMock(
+            return_value={
+                "features": [actual],
+                "featureStates": {"created": {"featureStatus": "OK"}},
+            }
+        )
+
+        result = await apply_feature_and_check(
+            onshape_client, "d", "w", "e", {"feature": requested}
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "unverified"
+        assert result.reason_code == "REQUESTED_STATE_UNVERIFIED"
+
+    @pytest.mark.asyncio
+    async def test_literal_update_does_not_treat_equal_valued_variable_as_satisfied(
+        self, onshape_client
+    ):
+        before = _extrude_feature(depth_expr="#depth", depth_value=0.015)
+        after = _extrude_feature(depth_expr="15 mm", depth_value=0.015)
+        onshape_client.get = AsyncMock(
+            side_effect=[
+                {"features": [before]},
+                {
+                    "features": [after],
+                    "featureStates": {"fId": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {"featureId": "fId", "featureType": "extrude"},
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+
+        result = await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "fId",
+            [{"parameterId": "depth", "expression": "15 mm"}],
+        )
+
+        assert result.ok is True
+        assert result.mutation_verification == "verified"
+        onshape_client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_equal_numeric_values_with_different_quantity_kinds_do_not_verify(
+        self, onshape_client
+    ):
+        before = _extrude_feature(depth_expr="10 mm", depth_value=0.01)
+        after = _extrude_feature(depth_expr="1 m", depth_value=1.0)
+        onshape_client.get = AsyncMock(
+            side_effect=[
+                {"features": [before]},
+                {
+                    "features": [after],
+                    "featureStates": {"fId": {"featureStatus": "OK"}},
+                },
+            ]
+        )
+        onshape_client.post = AsyncMock(
+            return_value={
+                "feature": {"featureId": "fId", "featureType": "extrude"},
+                "featureState": {"featureStatus": "OK"},
+            }
+        )
+
+        result = await update_feature_params_and_check(
+            onshape_client,
+            "d",
+            "w",
+            "e",
+            "fId",
+            [{"parameterId": "depth", "expression": "1 rad"}],
+        )
+
+        assert result.ok is False
+        assert result.mutation_verification == "failed"
 
     @pytest.mark.asyncio
     async def test_update_already_satisfied_is_no_effect_without_post(
