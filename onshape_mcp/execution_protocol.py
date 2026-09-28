@@ -18,6 +18,9 @@ from .governance.features import FeatureIndex
 _MAX_TEXT = 256
 _MAX_REQUEST_ITEMS = 32
 _MAX_BODIES = 32
+_MAX_FAILURE_ROWS = 50
+_MAX_COMPLEX_VALUE_ITEMS = 4
+_MAX_VALUE_DEPTH = 2
 _SUCCESSFUL_REGEN = frozenset({"OK", "INFO"})
 
 SUPPORTED_EXECUTION_OPERATIONS = frozenset(
@@ -98,13 +101,48 @@ def _bounded_text(value: Any, limit: int = _MAX_TEXT) -> str:
     return text if len(text) <= limit else f"{text[: max(0, limit - 1)]}\u2026"
 
 
-def _bounded_value(value: Any) -> Any:
+def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, str):
         return _bounded_text(value)
     if isinstance(value, (bool, int, float)) or value is None:
         return value
     if isinstance(value, list):
-        return [_bounded_value(item) for item in value[:_MAX_REQUEST_ITEMS]]
+        if depth >= _MAX_VALUE_DEPTH:
+            return {
+                "kind": "list",
+                "count": len(value),
+                "truncated": True,
+            }
+        if all(
+            isinstance(item, (str, bool, int, float)) or item is None
+            for item in value
+        ):
+            items = [
+                _bounded_value(item, depth=depth + 1)
+                for item in value[:_MAX_REQUEST_ITEMS]
+            ]
+            if len(items) == len(value):
+                return items
+            return {
+                "kind": "list",
+                "count": len(value),
+                "items": items,
+                "truncated": True,
+            }
+        items = [
+            _bounded_value(item, depth=depth + 1)
+            for item in value[:_MAX_COMPLEX_VALUE_ITEMS]
+        ]
+        return {
+            "kind": "list",
+            "count": len(value),
+            "items": items,
+            "truncated": len(items) < len(value)
+            or any(
+                isinstance(item, Mapping) and item.get("truncated") is True
+                for item in items
+            ),
+        }
     return "unsupported value"
 
 
@@ -173,8 +211,16 @@ def _compact_changes(changes: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, int):
             compact[key] = value
     for key in ("faces_added", "faces_removed", "edges_added", "edges_removed"):
+        explicit_count = changes.get(f"{key}_count")
         value = changes.get(key)
-        compact[f"{key}_count"] = len(value) if isinstance(value, list) else 0
+        if (
+            isinstance(explicit_count, int)
+            and not isinstance(explicit_count, bool)
+            and explicit_count >= 0
+        ):
+            compact[f"{key}_count"] = explicit_count
+        elif isinstance(value, list):
+            compact[f"{key}_count"] = len(value)
     for key in ("volume_before_mm3", "volume_after_mm3", "volume_delta_mm3"):
         value = changes.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -382,15 +428,16 @@ def compact_model_state(
         )
         for record in selected_records
     ]
-    failures = [
+    all_failures = [
         {
-            "feature_id": record.feature_id,
-            "name": record.name,
-            "status": record.status,
+            "feature_id": _bounded_text(record.feature_id, 128),
+            "name": _bounded_text(record.name),
+            "status": _bounded_text(record.status, 64),
         }
         for record in index.records
         if record.status.upper() in {"ERROR", "WARNING"}
     ]
+    failure_rows = all_failures[:_MAX_FAILURE_ROWS]
 
     part_rows = [
         {
@@ -434,7 +481,7 @@ def compact_model_state(
         "regeneration": {
             "state": _regeneration_state(index),
             "feature_count": len(index.records),
-            "failure_count": len(failures),
+            "failure_count": len(all_failures),
         },
         "bodies": {
             "count": len(parts),
@@ -448,7 +495,12 @@ def compact_model_state(
             "truncated": len(feature_rows) < len(index.records),
             "rows": feature_rows,
         },
-        "failures": failures,
+        "failures": {
+            "total": len(all_failures),
+            "returned": len(failure_rows),
+            "truncated": len(failure_rows) < len(all_failures),
+            "rows": failure_rows,
+        },
         "changed_feature_ids": changed,
         "unknown_or_stale": unknown_or_stale,
     }

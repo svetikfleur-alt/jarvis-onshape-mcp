@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 import httpx
+import jsonschema
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
@@ -2909,6 +2910,28 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+async def _validate_feature_operation_request(
+    operation: str, request: dict[str, Any]
+) -> None:
+    """Apply the selected public tool's own MCP schema before internal delegation."""
+
+    selected = next(
+        (tool for tool in await list_tools() if tool.name == operation),
+        None,
+    )
+    if selected is None:
+        raise MutationPreflightError(
+            f"No public tool schema is registered for operation {operation!r}"
+        )
+    try:
+        jsonschema.validate(instance=request, schema=selected.inputSchema)
+    except jsonschema.ValidationError as error:
+        location = ".".join(str(part) for part in error.absolute_path) or "request"
+        raise MutationPreflightError(
+            f"Invalid {operation} request at {location}: {error.validator} constraint failed"
+        ) from error
+
+
 METERS_TO_INCHES = 1 / 0.0254
 
 EXPORT_DIR = "/tmp/onshape-mcp-exports"
@@ -3587,6 +3610,7 @@ async def _call_tool_impl(
                 raise MutationPreflightError(
                     "responseMode must be 'compact' or 'diagnostic'"
                 )
+            await _validate_feature_operation_request(operation, request)
         except MutationPreflightError as error:
             return [
                 TextContent(

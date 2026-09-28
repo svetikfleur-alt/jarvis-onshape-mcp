@@ -588,3 +588,155 @@ async def test_outer_execute_feature_call_is_counted_once_by_response_mode(
     }
     assert compact_bytes < 4_000
     assert "face-new-249" not in compact_response[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "operation_request"),
+    [
+        (
+            "create_shell",
+            {**TARGET, "thickness": "2 mm", "faceIds": ["face-top"], "outward": "false"},
+        ),
+        (
+            "create_shell",
+            {**TARGET, "thickness": "2 mm", "faceIds": "face-top"},
+        ),
+        (
+            "create_extrude",
+            {
+                **TARGET,
+                "sketchFeatureId": "sketch-safe",
+                "depth": "10 mm",
+                "operationType": "SIDEWAYS",
+            },
+        ),
+        (
+            "create_extrude",
+            {**TARGET, "sketchFeatureId": "sketch-safe"},
+        ),
+    ],
+)
+async def test_execute_feature_validates_selected_tool_schema_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    operation_request: dict[str, object],
+) -> None:
+    apply = AsyncMock(return_value=server.FeatureApplyResult(
+        ok=True,
+        status="OK",
+        feature_id="must-not-exist",
+        feature_name="Must not mutate",
+        feature_type="test",
+        transport_ok=True,
+        http_ok=True,
+        regen_ok=True,
+        mutation_verification="verified",
+        changed=True,
+    ))
+    monkeypatch.setattr(server, "apply_feature_and_check", apply)
+
+    response = await server.call_tool(
+        "execute_feature",
+        {"operation": operation, "request": operation_request},
+    )
+    payload = json.loads(response[0].text)
+
+    apply.assert_not_awaited()
+    assert payload["tool"] == "execute_feature"
+    assert payload["mutation_verification"] == "failed"
+    assert payload["changed"] is False
+
+
+def test_compact_model_state_caps_and_bounds_failure_rows() -> None:
+    feature_count = 250
+    long_tail = "x" * 10_000
+    features_doc = {
+        "sourceMicroversion": "microversion-many-failures",
+        "features": [
+            {
+                "btType": "BTMFeature-134",
+                "featureId": f"failure-{index}",
+                "featureType": "extrude",
+                "name": f"Failure {index} {long_tail}",
+                "parameters": [],
+            }
+            for index in range(feature_count)
+        ],
+        "featureStates": {
+            f"failure-{index}": {"featureStatus": "ERROR", "messages": []}
+            for index in range(feature_count)
+        },
+    }
+
+    state = compact_model_state(
+        target=TARGET,
+        features_doc=features_doc,
+        parts=[],
+        recent_feature_limit=1,
+    )
+    rendered = json.dumps(state)
+
+    assert state["regeneration"]["failure_count"] == feature_count
+    assert state["failures"]["total"] == feature_count
+    assert state["failures"]["returned"] == 50
+    assert state["failures"]["truncated"] is True
+    assert len(state["failures"]["rows"][0]["name"]) <= 256
+    assert len(rendered.encode("utf-8")) < 40_000
+
+
+def test_compact_result_bounds_deeply_nested_requested_values() -> None:
+    nested: object = "leaf-" + ("z" * 250)
+    for _ in range(4):
+        nested = [nested for _ in range(16)]
+    compact = compact_execution_result(
+        "update_feature",
+        {
+            **TARGET,
+            "featureId": "extrude-safe",
+            "updates": [{"parameterId": "custom", "value": nested}],
+        },
+        _legacy_result(
+            ok=False,
+            mutation_verification="failed",
+            error_message="The requested value was rejected.",
+        ),
+    )
+    rendered = json.dumps(compact)
+    bounded_value = compact["requested_parameters"]["updates"][0]["value"]
+
+    assert bounded_value["kind"] == "list"
+    assert bounded_value["truncated"] is True
+    assert len(rendered.encode("utf-8")) < 8_000
+
+
+def test_compact_changes_preserve_parallel_branch_explicit_counts() -> None:
+    compact = compact_execution_result(
+        "move_body",
+        {
+            **TARGET,
+            "bodyIds": ["body-safe"],
+            "translationX": "5 mm",
+            "translationY": "0 mm",
+            "translationZ": "0 mm",
+        },
+        _legacy_result(
+            feature_id="move-safe",
+            feature_name="Move body",
+            feature_type="transform",
+            changes={
+                "summary": "faces +250/-250",
+                "faces_added_count": 250,
+                "faces_added_sample": [{"id": "face-sample"}],
+                "faces_added_truncated": True,
+                "edges_removed_count": 400,
+                "edges_removed_sample": [{"id": "edge-sample"}],
+                "edges_removed_truncated": True,
+            },
+        ),
+    )
+
+    assert compact["change_summary"]["faces_added_count"] == 250
+    assert compact["change_summary"]["edges_removed_count"] == 400
+    assert "face-sample" not in json.dumps(compact["change_summary"])
+    assert "faces_removed_count" not in compact["change_summary"]
