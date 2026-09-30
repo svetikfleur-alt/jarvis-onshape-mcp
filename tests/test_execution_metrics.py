@@ -10,6 +10,27 @@ from onshape_mcp.api.client import OnshapeClient, OnshapeCredentials
 from onshape_mcp.governance.metrics import ExecutionMetrics
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "expected_family"),
+    [
+        ("execute_feature", "mutation"),
+        ("inspect_feature_compact", "model_state"),
+        ("get_compact_model_state", "model_state"),
+        ("get_execution_protocol_metrics", "runtime"),
+    ],
+)
+def test_perf_metrics_classify_execution_protocol_tools(
+    tool_name: str, expected_family: str
+) -> None:
+    metrics = ExecutionMetrics()
+
+    metrics.record_tool(tool_name, response_bytes=1, elapsed_ms=1.0)
+
+    assert metrics.snapshot()["response_payloads_by_family"] == {
+        expected_family: {"count": 1, "total_bytes": 1, "max_bytes": 1}
+    }
+
+
 @pytest.mark.asyncio
 async def test_http_metrics_distinguish_targeted_broad_topology_and_mutation_reads() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:

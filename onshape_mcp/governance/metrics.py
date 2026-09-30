@@ -9,8 +9,14 @@ from typing import Any, Mapping, Optional
 
 
 def _tool_family(tool_name: str) -> str:
-    if tool_name in {"get_runtime_info", "get_execution_metrics"}:
+    if tool_name in {
+        "get_runtime_info",
+        "get_execution_metrics",
+        "get_execution_protocol_metrics",
+    }:
         return "runtime"
+    if tool_name == "execute_feature":
+        return "mutation"
     if tool_name in {
         "list_entities",
         "get_body_details",
@@ -28,6 +34,8 @@ def _tool_family(tool_name: str) -> str:
         "inspect_feature_dependencies",
         "get_dependency_slice",
         "get_context_status",
+        "inspect_feature_compact",
+        "get_compact_model_state",
     }:
         return "model_state"
     if tool_name.startswith(("render_", "crop_", "list_cached_images")):
