@@ -102,6 +102,12 @@ from .execution_protocol import (
     compact_feature,
     compact_model_state,
 )
+from .perception import (
+    PERCEPTION_SCHEMAS,
+    inspect_feature_context,
+    inspect_sketch_health,
+    validate_perception_arguments,
+)
 
 # Configure loguru to output to stderr
 logger.remove()  # Remove default handler
@@ -560,6 +566,36 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["documentId", "workspaceId", "elementId", "featureId"],
             },
+        ),
+        Tool(
+            name="inspect_sketch_health",
+            description=(
+                "Return bounded engineering health evidence for one sketch. Reports entity, "
+                "constraint, dimension, external-reference, and regeneration counts without "
+                "claiming solver DOF or fully-constrained state when the provider does not "
+                "expose it. Performs one authoritative full feature-tree read."
+            ),
+            inputSchema=PERCEPTION_SCHEMAS["inspect_sketch_health"],
+        ),
+        Tool(
+            name="inspect_feature_context",
+            description=(
+                "Return one bounded engineering context for a selected feature from one "
+                "authoritative full feature-tree read. Includes canonical parameters, "
+                "explicit upstream references, immediate downstream dependents, unresolved "
+                "reference evidence, and source revision without raw feature payloads."
+            ),
+            inputSchema=PERCEPTION_SCHEMAS["inspect_feature_context"],
+        ),
+        Tool(
+            name="get_visual_snapshot",
+            description=(
+                "Render a fresh, bounded multi-view Part Studio snapshot using the existing "
+                "Onshape shaded-view path. Every call performs new render requests; process-"
+                "cached images are never presented as freshness proof. Intended for sparse "
+                "engineering checkpoints, not automatic post-mutation rendering."
+            ),
+            inputSchema=PERCEPTION_SCHEMAS["get_visual_snapshot"],
         ),
         Tool(
             name="get_compact_model_state",
@@ -4073,6 +4109,172 @@ async def _call_tool_impl(
                     text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                 )
             ]
+
+    elif name in {
+        "inspect_sketch_health",
+        "inspect_feature_context",
+        "get_visual_snapshot",
+    }:
+        try:
+            request = validate_perception_arguments(name, arguments)
+        except (KeyError, TypeError, ValueError) as error:
+            payload = {
+                "ok": False,
+                "tool": name,
+                "error": {
+                    "type": "INVALID_ARGUMENT",
+                    "message": str(error)[:256] or "Invalid perception request",
+                },
+            }
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+
+        target = {
+            "document_id": request["documentId"],
+            "workspace_id": request["workspaceId"],
+            "element_id": request["elementId"],
+        }
+        try:
+            if name == "inspect_sketch_health":
+                features_doc = await partstudio_manager.get_features(
+                    request["documentId"],
+                    request["workspaceId"],
+                    request["elementId"],
+                )
+                payload = inspect_sketch_health(
+                    features_doc,
+                    sketch_feature_id=request.get("sketchFeatureId"),
+                    sketch_name=request.get("sketchName"),
+                )
+                payload["target"] = target
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    )
+                ]
+
+            if name == "inspect_feature_context":
+                features_doc = await partstudio_manager.get_features(
+                    request["documentId"],
+                    request["workspaceId"],
+                    request["elementId"],
+                )
+                payload = inspect_feature_context(
+                    features_doc,
+                    request["featureId"],
+                    parameter_limit=request.get("parameterLimit", 20),
+                    dependency_limit=request.get("dependencyLimit", 20),
+                )
+                payload["target"] = target
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    )
+                ]
+
+            views = request.get("views") or ["iso", "front", "top", "right"]
+            width = request.get("width", 640)
+            height = request.get("height", 480)
+            rendered = await shaded_view_manager.render_part_studio_views(
+                document_id=request["documentId"],
+                workspace_id=request["workspaceId"],
+                element_id=request["elementId"],
+                views=views,
+                width=width,
+                height=height,
+                edges=request.get("edges", True),
+            )
+            if len(rendered) != len(views):
+                raise RuntimeError("Shaded-view renderer returned an incomplete snapshot")
+            payload = {
+                "contract": "jarvis.visual_snapshot.v1",
+                "target": target,
+                "views": [view.to_dict() for view in rendered],
+                "metadata": {
+                    "source_revision": "unavailable",
+                    "bbox": "unavailable",
+                    "visible_body_count": "unavailable",
+                    "regeneration_summary": "unavailable",
+                    "width": width,
+                    "height": height,
+                },
+                "freshness": {
+                    "rendered_now": True,
+                    "proof": "rendered_during_this_tool_call",
+                },
+                "unknown_or_unavailable": [
+                    "source_revision",
+                    "bbox",
+                    "visible_body_count",
+                    "regeneration_summary",
+                ],
+            }
+            output: list[TextContent | ImageContent] = [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
+            ]
+            for view in rendered:
+                output.append(
+                    ImageContent(
+                        type="image",
+                        data=base64.b64encode(get_image(view.image_id)).decode("ascii"),
+                        mimeType="image/png",
+                    )
+                )
+            return output
+        except FeatureNotFoundError as error:
+            payload = {
+                "ok": False,
+                "tool": name,
+                "error": {
+                    "type": "FEATURE_NOT_FOUND",
+                    "message": "Feature not found in authoritative Part Studio state",
+                    "feature_id": error.feature_id,
+                },
+            }
+        except ValueError:
+            payload = {
+                "ok": False,
+                "tool": name,
+                "error": {
+                    "type": "TARGET_NOT_FOUND",
+                    "message": "Requested perception target could not be resolved",
+                },
+            }
+        except httpx.HTTPStatusError as error:
+            payload = {
+                "ok": False,
+                "tool": name,
+                "error": {
+                    "type": "ONSHAPE_READ_FAILED",
+                    "message": "Unable to read authoritative perception state",
+                    "status_code": error.response.status_code,
+                },
+            }
+        except Exception as error:
+            _log_unexpected_error("Unexpected perception error", error)
+            payload = {
+                "ok": False,
+                "tool": name,
+                "error": {
+                    "type": "PERCEPTION_FAILED",
+                    "message": "Unable to produce bounded perception evidence",
+                },
+            }
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
+        ]
 
     elif name == "get_compact_model_state":
         try:
