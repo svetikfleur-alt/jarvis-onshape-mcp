@@ -3737,6 +3737,7 @@ def _exception_json(
         "failure_kind": failure_kind,
         "reason_code": reason_code,
         "diagnostic": diagnostic,
+        "request_rejected": request_rejected,
     }
     if tool_name:
         payload["tool"] = tool_name
@@ -7477,6 +7478,34 @@ def _content_size_bytes(items: list[TextContent | ImageContent]) -> int:
     return total
 
 
+def _mutation_followup_eligible_from_public_result(
+    name: str, result: list[TextContent | ImageContent]
+) -> bool | None:
+    """Classify explicit execute_feature outcomes without re-deriving CAD truth."""
+
+    if name != "execute_feature":
+        return None
+    if len(result) != 1 or not isinstance(result[0], TextContent):
+        return True
+    try:
+        payload = json.loads(result[0].text)
+    except (TypeError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    if payload.get("request_rejected") is True:
+        return False
+    if payload.get("contract") != "jarvis.execution_result.v1":
+        return True
+    followup = payload.get("followup")
+    if not isinstance(followup, dict):
+        return True
+    return not (
+        followup.get("required") is False
+        and followup.get("reason") == "requested_state_already_satisfied"
+    )
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
     """Measure one outer MCP boundary without recounting nested delegation."""
@@ -7504,6 +7533,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         name,
         safe_arguments,
         response_bytes=response_bytes,
+        mutation_followup_eligible=_mutation_followup_eligible_from_public_result(
+            name, result
+        ),
     )
     return result
 

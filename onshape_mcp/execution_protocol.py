@@ -674,6 +674,7 @@ class ExecutionProtocolMetrics:
         arguments: Mapping[str, Any],
         *,
         response_bytes: int,
+        mutation_followup_eligible: bool | None = None,
     ) -> None:
         safe_bytes = max(0, int(response_bytes))
         family = _family(tool_name)
@@ -707,7 +708,10 @@ class ExecutionProtocolMetrics:
 
             if family == "mutation":
                 self._logical_operations += 1
-                if target_key is not None:
+                if (
+                    target_key is not None
+                    and mutation_followup_eligible is not False
+                ):
                     self._pending_mutation_targets.add(target_key)
             elif (
                 tool_name in _VERIFICATION_PROXY_TOOLS

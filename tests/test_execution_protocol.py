@@ -144,6 +144,24 @@ def _install_integrated_runtime(
     }
 
 
+async def _call_compact_verification_read(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    features_doc: dict[str, object] | None = None,
+) -> None:
+    get_features = AsyncMock(return_value=features_doc or _features_doc())
+    get_parts = AsyncMock(return_value=[])
+    monkeypatch.setattr(server.partstudio_manager, "get_features", get_features)
+    monkeypatch.setattr(server.partstudio_manager, "get_parts", get_parts)
+
+    response = await server.call_tool("get_compact_model_state", TARGET)
+    payload = json.loads(response[0].text)
+
+    assert payload["contract"] == "jarvis.compact_model_state.v1"
+    get_features.assert_awaited_once_with("doc-safe", "workspace-safe", "element-safe")
+    get_parts.assert_awaited_once_with("doc-safe", "workspace-safe", "element-safe")
+
+
 def test_canonical_request_exposes_only_reasoning_parameters() -> None:
     request = {
         **TARGET,
@@ -710,6 +728,44 @@ async def test_execute_feature_validates_selected_tool_schema_before_mutation(
     assert payload["changed"] is False
 
 
+@pytest.mark.asyncio
+async def test_execute_feature_preflight_rejection_does_not_create_pending_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protocol_metrics = ExecutionProtocolMetrics()
+    perf_metrics = ExecutionMetrics()
+    delegated = AsyncMock()
+    monkeypatch.setattr(server, "execution_protocol_metrics", protocol_metrics)
+    monkeypatch.setattr(server, "execution_metrics", perf_metrics)
+    monkeypatch.setattr(server, "_delegate_feature_operation", delegated)
+
+    response = await server.call_tool(
+        "execute_feature",
+        {
+            "operation": "create_shell",
+            "request": {
+                **TARGET,
+                "thickness": "2 mm",
+                "faceIds": "face-top",
+            },
+        },
+    )
+    payload = json.loads(response[0].text)
+    mutation_snapshot = protocol_metrics.snapshot()
+
+    delegated.assert_not_awaited()
+    assert payload["request_rejected"] is True
+    assert mutation_snapshot["mcp_tool_invocations"] == 1
+    assert mutation_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_snapshot["logical_operations"] == 1
+
+    await _call_compact_verification_read(monkeypatch)
+
+    snapshot = protocol_metrics.snapshot()
+    assert snapshot["verification_followup_proxy"] == 0
+    assert snapshot["logical_operations"] == 1
+
+
 def test_compact_model_state_caps_and_bounds_failure_rows() -> None:
     feature_count = 250
     long_tail = "x" * 10_000
@@ -1007,14 +1063,19 @@ async def test_execute_feature_prewrite_noop_preserves_caches_and_needs_no_follo
 
     payload = json.loads(response[0].text)
     perf_snapshot = metrics.snapshot()
+    mutation_protocol_snapshot = runtime["protocol_metrics"].snapshot()
+    await _call_compact_verification_read(monkeypatch, features_doc=cached_snapshot)
     protocol_snapshot = runtime["protocol_metrics"].snapshot()
     assert methods == ["GET"]
     assert perf_snapshot["http"]["calls"] == 1
     assert perf_snapshot["http"]["mutation_calls"] == 0
     assert perf_snapshot["tool_invocations"] == 1
     assert perf_snapshot["response_payloads_by_family"]["mutation"]["count"] == 1
-    assert protocol_snapshot["mcp_tool_invocations"] == 1
-    assert protocol_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_protocol_snapshot["mcp_tool_invocations"] == 1
+    assert mutation_protocol_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_protocol_snapshot["logical_operations"] == 1
+    assert protocol_snapshot["verification_followup_proxy"] == 0
+    assert protocol_snapshot["logical_operations"] == 1
     assert runtime["record"].raw_features == raw_before
     assert runtime["record"].cache_metadata == metadata_before
     assert runtime["record"].feature_index is runtime["index"]
@@ -1089,8 +1150,17 @@ async def test_execute_feature_transmitted_no_effect_stays_conservative(
         )
 
     payload = json.loads(response[0].text)
+    mutation_perf_snapshot = metrics.snapshot()
+    mutation_protocol_snapshot = runtime["protocol_metrics"].snapshot()
+    await _call_compact_verification_read(monkeypatch, features_doc=cached_snapshot)
+    protocol_snapshot = runtime["protocol_metrics"].snapshot()
     assert methods == ["GET", "POST", "GET"]
-    assert metrics.snapshot()["http"]["mutation_calls"] == 1
+    assert mutation_perf_snapshot["http"]["mutation_calls"] == 1
+    assert mutation_protocol_snapshot["mcp_tool_invocations"] == 1
+    assert mutation_protocol_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_protocol_snapshot["logical_operations"] == 1
+    assert protocol_snapshot["verification_followup_proxy"] == 1
+    assert protocol_snapshot["logical_operations"] == 1
     assert runtime["record"].cache_metadata["state"] == "partial"
     assert runtime["record"].cache_metadata["topology_state"] == "stale"
     assert runtime["topology_key"] not in runtime["entities"]._bodydetails_cache
@@ -1162,6 +1232,8 @@ async def test_execute_feature_verified_mutation_counts_one_outer_call_and_http_
 
     payload = json.loads(response[0].text)
     perf_snapshot = metrics.snapshot()
+    mutation_protocol_snapshot = runtime["protocol_metrics"].snapshot()
+    await _call_compact_verification_read(monkeypatch, features_doc=cached_snapshot)
     protocol_snapshot = runtime["protocol_metrics"].snapshot()
     assert methods == ["GET", "POST", "GET"]
     assert perf_snapshot["http"]["calls"] == 3
@@ -1170,8 +1242,10 @@ async def test_execute_feature_verified_mutation_counts_one_outer_call_and_http_
     assert perf_snapshot["tool_invocations"] == 1
     assert perf_snapshot["approx_model_tool_round_trips"] == 1
     assert perf_snapshot["response_payloads_by_family"]["mutation"]["count"] == 1
-    assert protocol_snapshot["mcp_tool_invocations"] == 1
-    assert protocol_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_protocol_snapshot["mcp_tool_invocations"] == 1
+    assert mutation_protocol_snapshot["model_tool_round_trip_proxy"] == 1
+    assert mutation_protocol_snapshot["logical_operations"] == 1
+    assert protocol_snapshot["verification_followup_proxy"] == 1
     assert protocol_snapshot["logical_operations"] == 1
     assert payload["mutation"]["state"] == "verified"
     assert payload["followup"] == {
