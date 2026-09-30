@@ -3335,6 +3335,11 @@ _CHANGE_LIST_FIELDS = (
     "edges_removed",
 )
 _CHANGE_SAMPLE_LIMIT = 8
+_PUBLIC_MUTATION_TEXT_LIMIT = 512
+_PUBLIC_MUTATION_LIST_LIMIT = 8
+_PUBLIC_MUTATION_MAPPING_LIMIT = 32
+_PUBLIC_MUTATION_DEPTH_LIMIT = 5
+_PUBLIC_MUTATION_TRUNCATION_PATH_LIMIT = 32
 
 
 def _compact_changes(changes: dict[str, Any]) -> dict[str, Any]:
@@ -3358,6 +3363,68 @@ def _compact_changes(changes: dict[str, Any]) -> dict[str, Any]:
         truncated = True
     compact["truncated"] = truncated
     return compact
+
+
+def _record_public_truncation(paths: list[str], path: str) -> None:
+    if (
+        path
+        and path not in paths
+        and len(paths) < _PUBLIC_MUTATION_TRUNCATION_PATH_LIMIT
+    ):
+        paths.append(path)
+
+
+def _bound_public_mutation_value(
+    value: Any,
+    *,
+    path: str,
+    depth: int,
+    truncated_paths: list[str],
+) -> Any:
+    """Bound the already-allowlisted public mutation payload recursively."""
+
+    if isinstance(value, str):
+        if len(value) <= _PUBLIC_MUTATION_TEXT_LIMIT:
+            return value
+        _record_public_truncation(truncated_paths, path)
+        return f"{value[: _PUBLIC_MUTATION_TEXT_LIMIT - 1]}…"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= _PUBLIC_MUTATION_DEPTH_LIMIT:
+        _record_public_truncation(truncated_paths, path)
+        return {"truncated": True}
+    if isinstance(value, list):
+        if len(value) > _PUBLIC_MUTATION_LIST_LIMIT:
+            _record_public_truncation(truncated_paths, path)
+        return [
+            _bound_public_mutation_value(
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                truncated_paths=truncated_paths,
+            )
+            for index, item in enumerate(value[:_PUBLIC_MUTATION_LIST_LIMIT])
+        ]
+    if isinstance(value, dict):
+        items = list(value.items())
+        if len(items) > _PUBLIC_MUTATION_MAPPING_LIMIT:
+            _record_public_truncation(truncated_paths, path)
+        bounded: dict[str, Any] = {}
+        for raw_key, item in items[:_PUBLIC_MUTATION_MAPPING_LIMIT]:
+            key = str(raw_key)
+            if len(key) > 128:
+                _record_public_truncation(truncated_paths, f"{path}.<key>")
+                key = f"{key[:127]}…"
+            child_path = f"{path}.{key}" if path else key
+            bounded[key] = _bound_public_mutation_value(
+                item,
+                path=child_path,
+                depth=depth + 1,
+                truncated_paths=truncated_paths,
+            )
+        return bounded
+    _record_public_truncation(truncated_paths, path)
+    return type(value).__name__
 
 
 def _feature_apply_json(
@@ -3402,7 +3469,20 @@ def _feature_apply_json(
     hints_list = list(hints) if hints else _hints_for_result(result)
     if hints_list:
         payload["hints"] = hints_list
-    return json.dumps(payload, indent=2)
+    truncated_fields = []
+    changes = payload.get("changes")
+    if isinstance(changes, dict) and changes.get("truncated") is True:
+        truncated_fields.append("changes")
+    bounded_payload = _bound_public_mutation_value(
+        payload,
+        path="",
+        depth=0,
+        truncated_paths=truncated_fields,
+    )
+    if truncated_fields:
+        bounded_payload["response_truncated"] = True
+        bounded_payload["truncated_fields"] = truncated_fields
+    return json.dumps(bounded_payload, indent=2)
 
 
 def _safe_exception_message(error: BaseException) -> str:

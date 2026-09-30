@@ -188,6 +188,7 @@ def canonical_request(operation: str, request: Mapping[str, Any]) -> dict[str, A
         result = {"feature_id": _bounded_text(request.get("featureId"), 128)}
         updates_out: list[dict[str, Any]] = []
         updates = request.get("updates")
+        update_count = len(updates) if isinstance(updates, list) else 0
         if isinstance(updates, list):
             for update in updates[:_MAX_REQUEST_ITEMS]:
                 if not isinstance(update, Mapping):
@@ -200,6 +201,9 @@ def canonical_request(operation: str, request: Mapping[str, Any]) -> dict[str, A
                         row[key] = _bounded_value(update[key])
                 updates_out.append(row)
         result["updates"] = updates_out
+        result["update_count"] = update_count
+        result["returned_update_count"] = len(updates_out)
+        result["updates_truncated"] = len(updates_out) < update_count
         return result
 
     result = {}

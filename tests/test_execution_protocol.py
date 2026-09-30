@@ -772,6 +772,26 @@ def test_compact_result_bounds_deeply_nested_requested_values() -> None:
     assert len(rendered.encode("utf-8")) < 8_000
 
 
+def test_update_request_projection_reports_bounded_row_truncation() -> None:
+    projection = canonical_request(
+        "update_feature",
+        {
+            **TARGET,
+            "featureId": "extrude-safe",
+            "updates": [
+                {"parameterId": f"parameter-{index}", "value": index}
+                for index in range(33)
+            ],
+        },
+    )
+
+    assert projection["update_count"] == 33
+    assert projection["returned_update_count"] == 32
+    assert projection["updates_truncated"] is True
+    assert len(projection["updates"]) == 32
+    assert projection["updates"][-1]["parameter_id"] == "parameter-31"
+
+
 def test_compact_changes_preserve_parallel_branch_explicit_counts() -> None:
     compact = compact_execution_result(
         "move_body",
@@ -1164,19 +1184,22 @@ async def test_execute_feature_verified_mutation_counts_one_outer_call_and_http_
 async def test_execute_feature_diagnostic_reuses_bounded_public_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    long_error = "upstream-error-" + ("x" * 40_000)
+    long_hint = "recovery-hint-" + ("y" * 20_000)
     result = server.FeatureApplyResult(
-        ok=True,
-        status="OK",
+        ok=False,
+        status="ERROR",
         feature_id="move-safe",
         feature_name="Move body",
         feature_type="transform",
+        error_message=long_error,
         transport_ok=True,
         http_ok=True,
-        regen_ok=True,
-        mutation_verification="verified",
+        regen_ok=False,
+        mutation_verification="failed",
         changed=True,
         verification_scope="feature_state",
-        reason_code="REQUESTED_STATE_VERIFIED",
+        reason_code="FEATURE_REGENERATION_ERROR",
         invalidation={
             "contexts_updated": 1,
             "feature_ids": ["move-safe"],
@@ -1196,7 +1219,11 @@ async def test_execute_feature_diagnostic_reuses_bounded_public_delta(
         return_value=[
             TextContent(
                 type="text",
-                text=server._feature_apply_json(result, tool_name="move_body"),
+                text=server._feature_apply_json(
+                    result,
+                    tool_name="move_body",
+                    hints=[long_hint for _ in range(20)],
+                ),
             )
         ]
     )
@@ -1219,13 +1246,22 @@ async def test_execute_feature_diagnostic_reuses_bounded_public_delta(
 
     payload = json.loads(response[0].text)
     changes = payload["diagnostic"]["legacy_result"]["changes"]
+    legacy = payload["diagnostic"]["legacy_result"]
     assert len(response[0].text.encode("utf-8")) < 10_000
     assert changes["faces_added_count"] == 500
     assert len(changes["faces_added_sample"]) == 8
     assert changes["faces_added_truncated"] is True
     assert changes["truncated"] is True
+    assert legacy["response_truncated"] is True
+    assert "error_message" in legacy["truncated_fields"]
+    assert "hints" in legacy["truncated_fields"]
+    assert len(legacy["error_message"]) <= 512
+    assert len(legacy["hints"]) == 8
+    assert all(len(hint) <= 512 for hint in legacy["hints"])
     assert "face-new-499" not in response[0].text
     assert "edge-old-499" not in response[0].text
+    assert long_error not in response[0].text
+    assert long_hint not in response[0].text
 
 
 @pytest.mark.asyncio
