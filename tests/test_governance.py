@@ -1,12 +1,15 @@
 """Focused tests for the token-governance pilot tools."""
 
+from copy import deepcopy
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 import onshape_mcp.server as server
+from onshape_mcp.api.entities import EntityManager
 from onshape_mcp.governance import BudgetPolicy, ContextStore, GovernanceBudgetError
+from onshape_mcp.governance.metrics import ExecutionMetrics
 from onshape_mcp.server import call_tool, list_tools
 
 
@@ -35,6 +38,88 @@ def _feature_payload(count: int = 3, *, name_size: int = 0) -> dict:
 def _decode(result) -> dict:
     assert len(result) == 1
     return json.loads(result[0].text)
+
+
+def _updatable_feature(depth_expression: str = "15 mm") -> dict:
+    return {
+        "btType": "BTMFeature-134",
+        "featureId": "feature-target",
+        "featureType": "extrude",
+        "name": "Extrude",
+        "parameters": [
+            {
+                "btType": "BTMParameterQuantity-147",
+                "parameterId": "depth",
+                "expression": depth_expression,
+                "value": 0.015 if depth_expression == "15 mm" else 0.01,
+            }
+        ],
+    }
+
+
+def _mutation_snapshot(
+    depth_expression: str = "15 mm", *, include_target: bool = True
+) -> dict:
+    features = []
+    states = {}
+    if include_target:
+        features.append(_updatable_feature(depth_expression))
+        states["feature-target"] = {"featureStatus": "OK"}
+    features.append(
+        {
+            "btType": "BTMSketch-151",
+            "featureId": "feature-sibling",
+            "featureType": "newSketch",
+            "name": "Sibling sketch",
+            "parameters": [],
+        }
+    )
+    states["feature-sibling"] = {"featureStatus": "OK"}
+    return {
+        "features": features,
+        "featureStates": states,
+        "sourceMicroversion": "cached-microversion",
+    }
+
+
+def _install_mutation_caches(monkeypatch, client, snapshot: dict) -> dict:
+    metrics = ExecutionMetrics()
+    store = ContextStore(metrics=metrics)
+    record = store.create("doc", "ws", "part-studio")
+    store.store_features(record.working_state.context_handle, snapshot)
+    index, _ = store.get_feature_index(record.working_state.context_handle)
+    store.mark_topology_fresh("doc", "ws", "part-studio")
+
+    entities = EntityManager(client, metrics=metrics)
+    topology_key = ("doc", "ws", "part-studio")
+    entities._bodydetails_cache[topology_key] = {"marker": "cached bodydetails"}
+    entities._face_frames_cache[topology_key] = {"marker": "cached face frames"}
+
+    sync_spies = {
+        "apply_delta": Mock(wraps=store.apply_authoritative_feature_delta),
+        "invalidate_model": Mock(wraps=store.invalidate_model),
+        "replace_snapshot": Mock(wraps=store.replace_authoritative_snapshot),
+        "invalidate_topology": Mock(wraps=entities.invalidate),
+    }
+    monkeypatch.setattr(
+        store, "apply_authoritative_feature_delta", sync_spies["apply_delta"]
+    )
+    monkeypatch.setattr(store, "invalidate_model", sync_spies["invalidate_model"])
+    monkeypatch.setattr(
+        store, "replace_authoritative_snapshot", sync_spies["replace_snapshot"]
+    )
+    monkeypatch.setattr(entities, "invalidate", sync_spies["invalidate_topology"])
+    monkeypatch.setattr(server, "context_store", store)
+    monkeypatch.setattr(server, "entity_manager", entities)
+    return {
+        "metrics": metrics,
+        "store": store,
+        "record": record,
+        "index": index,
+        "entities": entities,
+        "topology_key": topology_key,
+        "sync_spies": sync_spies,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -216,6 +301,203 @@ def test_workspace_invalidation_marks_all_matching_part_studio_contexts_stale():
     assert store.get(first.working_state.context_handle).cache_metadata["state"] == "stale"
     assert store.get(second.working_state.context_handle).cache_metadata["state"] == "stale"
     assert store.get(unrelated.working_state.context_handle).cache_metadata["state"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_update_prewrite_noop_preserves_feature_and_topology_caches(
+    monkeypatch, onshape_client
+):
+    cached_snapshot = _mutation_snapshot()
+    cached = _install_mutation_caches(monkeypatch, onshape_client, cached_snapshot)
+    metadata_before = deepcopy(cached["record"].cache_metadata)
+    raw_before = deepcopy(cached["record"].raw_features)
+    onshape_client.get = AsyncMock(
+        return_value={
+            "features": [_updatable_feature()],
+            "featureStates": {"feature-target": {"featureStatus": "OK"}},
+            "sourceMicroversion": "targeted-read-microversion",
+        }
+    )
+    onshape_client.post = AsyncMock()
+
+    result = await server.update_feature_params_and_check(
+        onshape_client,
+        "doc",
+        "ws",
+        "part-studio",
+        "feature-target",
+        [{"parameterId": "depth", "expression": "15 mm"}],
+    )
+
+    assert result.mutation_verification == "no_effect"
+    assert result.changed is False
+    assert result.transport_ok is None
+    assert result.http_ok is None
+    assert result.reason_code == "REQUESTED_STATE_ALREADY_PRESENT"
+    assert onshape_client.post.await_count == 0
+    assert onshape_client.get.await_count == 1
+    assert cached["record"].raw_features == raw_before
+    assert cached["record"].cache_metadata == metadata_before
+    assert cached["record"].feature_index is cached["index"]
+    assert cached["topology_key"] in cached["entities"]._bodydetails_cache
+    assert cached["topology_key"] in cached["entities"]._face_frames_cache
+    assert cached["sync_spies"]["apply_delta"].call_count == 0
+    assert cached["sync_spies"]["invalidate_model"].call_count == 0
+    assert cached["sync_spies"]["replace_snapshot"].call_count == 0
+    assert cached["sync_spies"]["invalidate_topology"].call_count == 0
+    assert cached["metrics"].snapshot()["cache"]["invalidations"] == 0
+    assert result.invalidation == {
+        "contexts_updated": 0,
+        "feature_ids": ["feature-target"],
+        "feature_cache": "unchanged",
+        "topology_cache": "unchanged",
+        "topology_snapshot_evicted": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_transmitted_update_no_effect_remains_conservatively_invalidated(
+    monkeypatch, onshape_client
+):
+    cached = _install_mutation_caches(
+        monkeypatch, onshape_client, _mutation_snapshot("10 mm")
+    )
+    onshape_client.get = AsyncMock(
+        side_effect=[
+            {
+                "features": [_updatable_feature("10 mm")],
+                "featureStates": {"feature-target": {"featureStatus": "OK"}},
+            },
+            {
+                "features": [_updatable_feature("10 mm")],
+                "featureStates": {"feature-target": {"featureStatus": "OK"}},
+                "sourceMicroversion": "post-write-microversion",
+            },
+        ]
+    )
+    onshape_client.post = AsyncMock(
+        return_value={
+            "feature": {"featureId": "feature-target", "featureType": "extrude"},
+            "featureState": {"featureStatus": "OK"},
+        }
+    )
+
+    result = await server.update_feature_params_and_check(
+        onshape_client,
+        "doc",
+        "ws",
+        "part-studio",
+        "feature-target",
+        [{"parameterId": "depth", "expression": "15 mm"}],
+    )
+
+    assert result.mutation_verification == "no_effect"
+    assert result.changed is False
+    assert result.transport_ok is True
+    assert result.http_ok is True
+    assert result.reason_code == "REQUESTED_STATE_UNCHANGED"
+    assert onshape_client.post.await_count == 1
+    assert cached["record"].cache_metadata["state"] == "partial"
+    assert cached["record"].cache_metadata["topology_state"] == "stale"
+    assert cached["record"].cache_metadata["invalidations"] == 1
+    assert cached["topology_key"] not in cached["entities"]._bodydetails_cache
+    assert cached["topology_key"] not in cached["entities"]._face_frames_cache
+    assert cached["sync_spies"]["apply_delta"].call_count == 1
+    assert cached["sync_spies"]["invalidate_model"].call_count == 0
+    assert cached["sync_spies"]["replace_snapshot"].call_count == 0
+    assert cached["sync_spies"]["invalidate_topology"].call_count == 1
+    assert cached["metrics"].snapshot()["cache"]["invalidations"] == 2
+    assert result.invalidation == {
+        "contexts_updated": 1,
+        "feature_ids": ["feature-target"],
+        "feature_cache": "partially_refreshed",
+        "topology_cache": "invalidated",
+        "topology_snapshot_evicted": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_delete_prewrite_noop_preserves_feature_and_topology_caches(
+    monkeypatch, onshape_client
+):
+    cached_snapshot = _mutation_snapshot(include_target=False)
+    cached = _install_mutation_caches(monkeypatch, onshape_client, cached_snapshot)
+    metadata_before = deepcopy(cached["record"].cache_metadata)
+    raw_before = deepcopy(cached["record"].raw_features)
+    manager = AsyncMock()
+    manager.get_features = AsyncMock(return_value=cached_snapshot)
+    manager.delete_feature = AsyncMock()
+
+    result = await server.delete_partstudio_feature_and_check(
+        manager, "doc", "ws", "part-studio", "feature-target"
+    )
+
+    assert result.mutation_verification == "no_effect"
+    assert result.changed is False
+    assert result.transport_ok is None
+    assert result.http_ok is None
+    assert result.reason_code == "FEATURE_ALREADY_ABSENT"
+    assert manager.delete_feature.await_count == 0
+    assert manager.get_features.await_count == 1
+    assert cached["record"].raw_features == raw_before
+    assert cached["record"].cache_metadata == metadata_before
+    assert cached["record"].feature_index is cached["index"]
+    assert cached["topology_key"] in cached["entities"]._bodydetails_cache
+    assert cached["topology_key"] in cached["entities"]._face_frames_cache
+    assert cached["sync_spies"]["apply_delta"].call_count == 0
+    assert cached["sync_spies"]["invalidate_model"].call_count == 0
+    assert cached["sync_spies"]["replace_snapshot"].call_count == 0
+    assert cached["sync_spies"]["invalidate_topology"].call_count == 0
+    assert cached["metrics"].snapshot()["cache"]["invalidations"] == 0
+    assert result.invalidation == {
+        "contexts_updated": 0,
+        "feature_ids": ["feature-target"],
+        "feature_cache": "unchanged",
+        "topology_cache": "unchanged",
+        "topology_snapshot_evicted": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_verified_delete_still_refreshes_feature_cache_and_evicts_topology(
+    monkeypatch, onshape_client
+):
+    before = _mutation_snapshot()
+    after = _mutation_snapshot(include_target=False)
+    after["sourceMicroversion"] = "post-delete-microversion"
+    cached = _install_mutation_caches(monkeypatch, onshape_client, before)
+    manager = AsyncMock()
+    manager.get_features = AsyncMock(side_effect=[before, after])
+    manager.delete_feature = AsyncMock(return_value={})
+
+    result = await server.delete_partstudio_feature_and_check(
+        manager, "doc", "ws", "part-studio", "feature-target"
+    )
+
+    assert result.mutation_verification == "verified"
+    assert result.changed is True
+    assert result.transport_ok is True
+    assert result.http_ok is True
+    assert result.reason_code == "FEATURE_ABSENCE_VERIFIED"
+    assert manager.delete_feature.await_count == 1
+    assert cached["record"].raw_features == after
+    assert cached["record"].cache_metadata["state"] == "ready"
+    assert cached["record"].cache_metadata["topology_state"] == "stale"
+    assert cached["record"].cache_metadata["invalidations"] == 1
+    assert cached["topology_key"] not in cached["entities"]._bodydetails_cache
+    assert cached["topology_key"] not in cached["entities"]._face_frames_cache
+    assert cached["sync_spies"]["apply_delta"].call_count == 0
+    assert cached["sync_spies"]["invalidate_model"].call_count == 0
+    assert cached["sync_spies"]["replace_snapshot"].call_count == 1
+    assert cached["sync_spies"]["invalidate_topology"].call_count == 1
+    assert cached["metrics"].snapshot()["cache"]["invalidations"] == 2
+    assert result.invalidation == {
+        "contexts_updated": 1,
+        "feature_ids": ["feature-target"],
+        "feature_cache": "refreshed",
+        "topology_cache": "invalidated",
+        "topology_snapshot_evicted": True,
+    }
 
 
 @pytest.mark.asyncio

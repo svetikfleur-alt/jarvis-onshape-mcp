@@ -221,6 +221,31 @@ context_store = ContextStore(metrics=execution_metrics)
 hygiene_tracker = DocumentHygieneTracker()
 
 
+def _is_prewrite_noop(result: FeatureApplyResult) -> bool:
+    """Return whether authoritative result fields prove no write was transmitted."""
+
+    return (
+        result.mutation_verification == "no_effect"
+        and result.changed is False
+        and result.transport_ok is None
+        and result.http_ok is None
+    )
+
+
+def _unchanged_partstudio_cache_projection(
+    result: FeatureApplyResult,
+) -> dict[str, Any]:
+    """Describe the cache state preserved by a proven pre-write no-op."""
+
+    return {
+        "contexts_updated": 0,
+        "feature_ids": [result.feature_id] if result.feature_id else [],
+        "feature_cache": "unchanged",
+        "topology_cache": "unchanged",
+        "topology_snapshot_evicted": False,
+    }
+
+
 def _sync_partstudio_mutation_state(
     result: FeatureApplyResult,
     document_id: str,
@@ -229,7 +254,11 @@ def _sync_partstudio_mutation_state(
     *,
     created: bool = False,
 ) -> None:
-    """Reconcile feature caches and invalidate topology after a mutation attempt."""
+    """Reconcile caches unless the result proves a pre-write no-op."""
+
+    if _is_prewrite_noop(result):
+        result.invalidation = _unchanged_partstudio_cache_projection(result)
+        return
 
     reread = result.raw.get("reread")
     if isinstance(reread, dict):
@@ -321,6 +350,10 @@ async def delete_partstudio_feature_and_check(
         feature_id,
         **kwargs,
     )
+    if _is_prewrite_noop(result):
+        result.invalidation = _unchanged_partstudio_cache_projection(result)
+        return result
+
     reread = result.raw.get("reread")
     if isinstance(reread, dict):
         invalidation = context_store.replace_authoritative_snapshot(
