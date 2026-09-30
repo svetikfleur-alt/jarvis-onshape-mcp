@@ -181,7 +181,7 @@ def inspect_sketch_health(
     messages = state.get("messages") if isinstance(state, dict) else []
     message_count = len(messages) if isinstance(messages, list) else 0
     warnings: list[str] = []
-    if str(summary["status"]).upper() not in {"OK", "?"}:
+    if str(summary["status"]).upper() not in {"OK", "INFO", "?"}:
         warnings.append(f"Sketch regeneration status is {_bounded_text(summary['status'], 64)}")
     if message_count:
         warnings.append(

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from onshape_mcp.perception import inspect_feature_context, inspect_sketch_health
 
 
@@ -27,7 +29,11 @@ def _constraint(
     }
 
 
-def _sketch_document(*, status: str = "OK") -> dict[str, object]:
+def _sketch_document(
+    *,
+    status: str = "OK",
+    messages: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
     return {
         "sourceMicroversion": "microversion-sketch-safe",
         "features": [
@@ -67,7 +73,9 @@ def _sketch_document(*, status: str = "OK") -> dict[str, object]:
         "featureStates": {
             "sketch-safe": {
                 "featureStatus": status,
-                "messages": [{"message": "provider detail intentionally not copied"}],
+                "messages": messages
+                if messages is not None
+                else [{"message": "provider detail intentionally not copied"}],
             }
         },
     }
@@ -127,6 +135,27 @@ def test_sketch_health_returns_engineering_counts_without_solver_invention() -> 
         "source": "unavailable",
     }
     assert "FULLY_CONSTRAINED" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_warnings"),
+    [
+        ("INFO", []),
+        ("OK", []),
+        ("WARNING", ["Sketch regeneration status is WARNING"]),
+        ("ERROR", ["Sketch regeneration status is ERROR"]),
+    ],
+)
+def test_sketch_health_classifies_regeneration_status(
+    status: str,
+    expected_warnings: list[str],
+) -> None:
+    result = inspect_sketch_health(
+        _sketch_document(status=status, messages=[]),
+        sketch_feature_id="sketch-safe",
+    )
+
+    assert result["warnings"] == expected_warnings
 
 
 def test_sketch_health_surfaces_regeneration_error_without_copying_raw_messages() -> None:
