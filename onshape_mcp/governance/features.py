@@ -411,6 +411,9 @@ class FeatureIndex:
             "upstream": upstream,
             "downstream": downstream,
             "unresolved_references": unresolved_rows,
+            "upstream_count": len(upstream_edges),
+            "downstream_count": len(downstream_edges),
+            "unresolved_reference_count": len(unresolved),
             "completeness": {
                 "status": "PARTIAL" if unresolved else "KNOWN_REFERENCES_ONLY",
                 "absence_proves_independence": False,
