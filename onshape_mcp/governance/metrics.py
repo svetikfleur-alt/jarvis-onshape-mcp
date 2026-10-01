@@ -36,9 +36,13 @@ def _tool_family(tool_name: str) -> str:
         "get_context_status",
         "inspect_feature_compact",
         "get_compact_model_state",
+        "inspect_sketch_health",
+        "inspect_feature_context",
     }:
         return "model_state"
-    if tool_name.startswith(("render_", "crop_", "list_cached_images")):
+    if tool_name == "get_visual_snapshot" or tool_name.startswith(
+        ("render_", "crop_", "list_cached_images")
+    ):
         return "rendering"
     if tool_name.startswith(("create_", "update_", "delete_", "edit_", "move_", "set_", "add_", "write_")):
         return "mutation"

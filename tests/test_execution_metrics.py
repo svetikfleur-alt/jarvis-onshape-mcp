@@ -16,6 +16,9 @@ from onshape_mcp.governance.metrics import ExecutionMetrics
         ("execute_feature", "mutation"),
         ("inspect_feature_compact", "model_state"),
         ("get_compact_model_state", "model_state"),
+        ("inspect_sketch_health", "model_state"),
+        ("inspect_feature_context", "model_state"),
+        ("get_visual_snapshot", "rendering"),
         ("get_execution_protocol_metrics", "runtime"),
     ],
 )
@@ -26,7 +29,10 @@ def test_perf_metrics_classify_execution_protocol_tools(
 
     metrics.record_tool(tool_name, response_bytes=1, elapsed_ms=1.0)
 
-    assert metrics.snapshot()["response_payloads_by_family"] == {
+    snapshot = metrics.snapshot()
+    assert snapshot["tool_invocations"] == 1
+    assert snapshot["approx_model_tool_round_trips"] == 1
+    assert snapshot["response_payloads_by_family"] == {
         expected_family: {"count": 1, "total_bytes": 1, "max_bytes": 1}
     }
 

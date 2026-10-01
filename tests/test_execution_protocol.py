@@ -413,6 +413,56 @@ def test_metrics_count_outer_operations_and_response_families() -> None:
     }
 
 
+def test_metrics_classify_perception_tools_without_changing_operation_counters() -> None:
+    metrics = ExecutionProtocolMetrics()
+
+    metrics.record("inspect_sketch_health", TARGET, response_bytes=100)
+    metrics.record("inspect_feature_context", TARGET, response_bytes=200)
+    metrics.record("get_visual_snapshot", TARGET, response_bytes=300)
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["mcp_tool_invocations"] == 3
+    assert snapshot["model_tool_round_trip_proxy"] == 3
+    assert snapshot["logical_operations"] == 0
+    assert snapshot["verification_followup_proxy"] == 0
+    assert snapshot["target_resolution_call_proxy"] == 0
+    assert snapshot["by_family"] == {
+        "inspection": {
+            "calls": 2,
+            "response_bytes": 300,
+            "max_response_bytes": 200,
+        },
+        "rendering": {
+            "calls": 1,
+            "response_bytes": 300,
+            "max_response_bytes": 300,
+        },
+    }
+
+
+def test_perception_tools_preserve_pending_mutation_verification_target() -> None:
+    metrics = ExecutionProtocolMetrics()
+
+    metrics.record(
+        "execute_feature",
+        {**TARGET, "operation": "create_extrude"},
+        response_bytes=1_200,
+    )
+    metrics.record("inspect_sketch_health", TARGET, response_bytes=100)
+    metrics.record("inspect_feature_context", TARGET, response_bytes=200)
+    metrics.record("get_visual_snapshot", TARGET, response_bytes=300)
+    metrics.record("describe_part_studio", TARGET, response_bytes=9_000)
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["mcp_tool_invocations"] == 5
+    assert snapshot["model_tool_round_trip_proxy"] == 5
+    assert snapshot["logical_operations"] == 1
+    assert snapshot["verification_followup_proxy"] == 1
+    assert snapshot["target_resolution_call_proxy"] == 0
+
+
 @pytest.mark.asyncio
 async def test_preferred_protocol_tools_have_bounded_schemas() -> None:
     tools = {tool.name: tool for tool in await server.list_tools()}

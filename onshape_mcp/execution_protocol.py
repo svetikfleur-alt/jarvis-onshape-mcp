@@ -627,6 +627,10 @@ _RESOLUTION_PROXY_TOOLS = frozenset(
         "inspect_feature_compact",
     }
 )
+_PERCEPTION_INSPECTION_TOOLS = frozenset(
+    {"inspect_sketch_health", "inspect_feature_context"}
+)
+_RENDERING_TOOLS = frozenset({"get_visual_snapshot"})
 
 
 def _target_key(arguments: Mapping[str, Any]) -> tuple[str, str, str] | None:
@@ -643,8 +647,10 @@ def _family(tool_name: str) -> str:
         return "mutation"
     if tool_name in _VERIFICATION_PROXY_TOOLS:
         return "verification"
-    if tool_name in _RESOLUTION_PROXY_TOOLS:
+    if tool_name in _RESOLUTION_PROXY_TOOLS or tool_name in _PERCEPTION_INSPECTION_TOOLS:
         return "inspection"
+    if tool_name in _RENDERING_TOOLS:
+        return "rendering"
     return "other"
 
 
