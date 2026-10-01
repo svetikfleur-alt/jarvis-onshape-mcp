@@ -1,6 +1,6 @@
 ---
 name: onshape
-description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Render-first and entity-first workflows, unit + coordinate conventions, iteration discipline, when to reach for FeatureScript, and the gotchas (REMOVE-on-face auto-flip, Variable Studios as separate elements, deterministic ID remapping). Load before building anything in Onshape — the plugin's MCP tool surface makes more sense with this doc in context.
+description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Staged verification and entity-first workflows, unit + coordinate conventions, iteration discipline, when to reach for FeatureScript, and provider-specific gotchas. Load before building anything in Onshape.
 ---
 
 # Jarvis Onshape MCP — Claude Skill Guide
@@ -8,22 +8,15 @@ description: Protocols for driving Onshape CAD via the onshape-mcp plugin. Rende
 Loaded as context for any Claude session driving the Jarvis Onshape MCP plugin.
 Encodes the protocols that keep CAD builds from silently failing. Short, imperative.
 
-## Think out loud
+## Concise operational narration
 
-Before every non-trivial tool call (sketch, extrude, boolean, fillet,
-chamfer, describe, export), emit a short plan text (1-3 sentences, plain
-assistant output) saying **WHY** you're making this call and **WHAT you
-expect to see / build**. Example before an extrude:
+Before a material mutation or inspection, state the intended change and expected
+evidence in one short sentence. Afterward, report a mismatch, warning, blocker,
+or decision that affects later work. Do not print the complete engineering
+checklist or narrate routine stable-state checks.
 
-> *"Extruding the base rectangle 30 mm up. Expect a flat plate with the
-> four corner arcs intact, bbox (500, 780, 30)."*
-
-After each result, also say 1-2 sentences about **what actually happened**
-— especially if the result surprised you. If a describe_part_studio shows
-a feature at the wrong Z, name that out loud before deciding how to fix.
-
-Don't let your only visible output be tool-call JSON. The observer watching
-the run relies on these thought lines to catch bugs in your reasoning.
+Example: *"Extruding the base rectangle 30 mm; expect one plate body with the
+four corner arcs preserved."*
 
 ## Units
 
@@ -44,7 +37,7 @@ This applies on the assembly side too: `transform_instance` translations, `set_i
 
 When sketching on a picked face (`faceId` from `list_entities`), the sketch-local axes are defined by that face's own coordinate system. Geometry you sketch is interpreted in the face's plane, not world space.
 
-## The verified-execution and visual-checkpoint protocol
+## The verified-execution and staged-checkpoint protocol
 
 For supported Part Studio mutations, prefer `execute_feature`. You still make
 the engineering decision: choose exactly one operation, target, entity set,
@@ -89,6 +82,36 @@ the current decision needs.
   `get_body_details`, `list_entities`, and `describe_part_studio` tools remain
   available. Use `execute_feature(responseMode="diagnostic")` when you need
   its delegated public result in addition to the compact contract.
+
+### Staged engineering checkpoints and perception
+
+Use the mutation result and local feature/sketch evidence after each change. Do
+not call a full describe or render after every feature.
+
+At major checkpoints—after primary form, after major functional geometry, around
+one bounded refinement pass, and at final review—request only the evidence the
+engineering decision needs:
+
+1. Verify the relevant feature status and requested state in text first with the
+   compact result, `inspect_feature_compact`, or `get_compact_model_state`.
+2. Use `inspect_sketch_health` when progress or acceptance depends on production
+   sketch health. If authoritative constraint state is unavailable, classify it
+   as `UNKNOWN`; successful regeneration, extrusion, constraint counts, or a
+   render do not prove that a sketch is adequately constrained according to
+   intent.
+3. Use `inspect_feature_context` when repair, reference stability, or the next
+   feature requires bounded upstream/downstream dependency evidence.
+4. Use `get_visual_snapshot` for a fresh render when a visual checkpoint is
+   required. Inspect the appropriate view for orientation, topology, proportion,
+   or missing visible geometry; crop only a suspicious area.
+5. Check affected bodies, measurements, mass properties, or
+   `describe_part_studio` when the claim needs those structured geometry layers.
+
+Add an intermediate inspection when a mutation is `unverified`, state is
+surprising, or the next feature depends on a newly generated entity. Reuse known
+stable evidence otherwise. Requested-state verification, sketch-solver health,
+dependency context, measurements, and images prove different layers; none alone
+proves engineering completion.
 
 ## Sketches: coordinate-first vs constraint-first
 

@@ -143,7 +143,7 @@ regen warnings. If it takes a wrong direction on an extrude, the
 
 ## Protocol guide
 
-Two plugin skills auto-discovered by Claude Code:
+Seven focused plugin skills are auto-discovered by Claude Code:
 
 - `skills/onshape/SKILL.md` — **CAD build skill**. Loaded into every Onshape
   session. Covers units (bare numbers in mm), coordinate frames (Front is XZ
@@ -159,8 +159,29 @@ Two plugin skills auto-discovered by Claude Code:
   review before committing turns to the build. See "Recommended workflow"
   below.
 
-You can load either into any Claude session as a system prompt to get the
-same behavior outside the plugin context.
+- `skills/cad-engineering-core/SKILL.md` — **Engineering doctrine**. Separates
+  shape, parametric, manufacturing, and document quality and defines bounded
+  evidence and inspection rules.
+
+- `skills/sketch-engineering/SKILL.md` — **Sketch discipline**. Requires datum
+  intent, relations, design dimensions, authoritative constraint-health checks,
+  and rejects blanket `Fix` as a substitute for design intent.
+
+- `skills/parametric-modeling/SKILL.md` — **Feature-history discipline**.
+  Covers ordering, shared parameters, intentional repetition, edit-versus-
+  compensate decisions, and bounded root-cause repair.
+
+- `skills/reference-stability/SKILL.md` — **Reference selection**. Chooses
+  references by intended meaning and survival under modest upstream edits.
+
+- `skills/engineering-review/SKILL.md` — **Completion gate**. Runs one bounded
+  functional, parametric, structural, manufacturing, document, and visual
+  review, with at most one refinement pass.
+
+You can load the relevant skills into any Claude session as system context to
+get the same behavior outside the plugin context. Pair the provider-specific
+`onshape` skill with `cad-engineering-core` and the task-specific engineering
+skills; do not load every skill when the task does not need it.
 
 ## Recommended workflow
 
