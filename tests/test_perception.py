@@ -288,6 +288,43 @@ def test_feature_context_keeps_unknown_geometry_reference_unresolved() -> None:
     ]
 
 
+def test_feature_context_does_not_treat_zero_downstream_as_independence() -> None:
+    document = {
+        "features": [
+            _feature("source-safe", "newSketch"),
+            _feature(
+                "possible-consumer",
+                "fillet",
+                parameters=[
+                    {
+                        "btType": "BTMParameterQueryList-148",
+                        "parameterId": "entities",
+                        "queries": [
+                            {
+                                "btType": "BTMIndividualQuery-138",
+                                "deterministicIds": ["edge-from-source"],
+                            }
+                        ],
+                    }
+                ],
+            ),
+        ]
+    }
+
+    result = inspect_feature_context(document, "source-safe")
+
+    assert result["downstream"]["count"] == 0
+    assert result["reference_health"]["unresolved"]["count"] == 0
+    assert result["reference_health"]["completeness"] == {
+        "status": "KNOWN_REFERENCES_ONLY",
+        "absence_proves_independence": False,
+        "limitation": (
+            "Only explicit cached feature references become edges; unresolved geometry "
+            "references may hide additional dependencies."
+        ),
+    }
+
+
 def test_large_feature_tree_reports_total_counts_but_bounds_rows_and_parameters() -> None:
     features = [_feature("root-safe", "newSketch")]
     features.extend(

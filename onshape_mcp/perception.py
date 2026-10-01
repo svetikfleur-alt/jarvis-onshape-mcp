@@ -252,6 +252,7 @@ def inspect_feature_context(
     downstream_rows = dependencies["downstream"]
     unresolved_rows = dependencies["unresolved_references"]
     unresolved_count = dependencies["unresolved_reference_count"]
+    completeness = dependencies["completeness"]
     reference_warnings: list[str] = []
     if unresolved_count:
         reference_warnings.append(
@@ -297,6 +298,13 @@ def inspect_feature_context(
                 "evidence_types": sorted(
                     {row["evidenceType"] for row in upstream_rows}
                 ),
+            },
+            "completeness": {
+                "status": _bounded_text(completeness["status"], 64),
+                "absence_proves_independence": bool(
+                    completeness["absence_proves_independence"]
+                ),
+                "limitation": _bounded_text(completeness["limitation"]),
             },
             "unresolved": {
                 "count": unresolved_count,
